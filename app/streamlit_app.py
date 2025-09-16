@@ -18,41 +18,37 @@ st.markdown("> **Preliminary estimates only.** For detailed results, a full ener
 
 # Load data
 weather_df = load_weather()
-st.caption("Weather CSV headers: " + ", ".join(map(str, weather_df.columns)))
 lists_df = load_lists()
 lookup_df = load_savings_lookup()
 
 # --- Step 1: Project & Location ---
 st.header("1) Project & Location")
 
-# Use the exact headers your CSV exposes and ignore extra "None" columns
+# We know the exact headers from your CSV caption:
 REQUIRED_COLS = ["State", "Cities", "Heating Degree Days (HDD)", "Cooling Degree Days (CDD)"]
 missing = [c for c in REQUIRED_COLS if c not in weather_df.columns]
 if missing:
     st.error(f"'data/weather_information.csv' is missing required columns: {', '.join(missing)}")
     st.stop()
 
-# Keep only the columns we need and drop blank rows
+# Keep only the needed columns and clean up
 wdf = weather_df[REQUIRED_COLS].copy()
-wdf = wdf.dropna(subset=["State", "Cities"])  # make sure both exist
-# Normalize types/whitespace
+wdf = wdf.dropna(subset=["State", "Cities"])
 wdf["State"] = wdf["State"].astype(str).str.strip()
 wdf["Cities"] = wdf["Cities"].astype(str).str.strip()
 
-# Build selectors
+# Selectors
 states = sorted(wdf["State"].unique().tolist())
 state = st.selectbox("State", states)
-
 cities = sorted(wdf.loc[wdf["State"] == state, "Cities"].unique().tolist())
 city = st.selectbox("City", cities)
 
-# Lookup HDD/CDD for the selected row
+# Lookup HDD/CDD
 sel = wdf[(wdf["State"] == state) & (wdf["Cities"] == city)]
 if sel.empty:
     st.error("Selected State/City not found in weather_information.csv.")
     st.stop()
 
-# Coerce numeric (handles strings like '3,456')
 def to_num(x):
     try:
         return float(str(x).replace(",", ""))
@@ -61,7 +57,6 @@ def to_num(x):
 
 hdd = to_num(sel["Heating Degree Days (HDD)"].iloc[0])
 cdd = to_num(sel["Cooling Degree Days (CDD)"].iloc[0])
-
 if hdd is None or cdd is None:
     st.error("HDD/CDD values could not be parsed as numbers.")
     st.stop()
@@ -77,12 +72,6 @@ gas_utility  = st.text_input("Natural Gas Utility (optional)")
 
 # Load weather (already done earlier via engine.load_weather)
 wdf = weather_df
-
-# Try flexible header matches
-state_col = find_col(wdf, "State")
-city_col  = find_col(wdf, "City")
-hdd_col   = find_col(wdf, "HDD", "Heating Degree Days", "Heating Degree Days (HDD)")
-cdd_col   = find_col(wdf, "CDD", "Cooling Degree Days", "Cooling Degree Days (CDD)")
 
 # Debug helper (optional): show what we resolved
 # st.caption(f"Resolved columns → State: {state_col}, City: {city_col}, HDD: {hdd_col}, CDD: {cdd_col}")
