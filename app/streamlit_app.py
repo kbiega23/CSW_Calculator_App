@@ -86,38 +86,121 @@ def _clean_options(series):
 
 def hvac_options_for_building(lists_df: pd.DataFrame, building_label: str):
     """
-    Reads lists.csv as-is and finds the column for HVAC types that matches the
-    selected building. Works with headers like 'HVAC Type, Office',
-    'HVAC Type, Hotel', 'HVAC Type, Hosp', 'HVAC Type, MF', etc.
+    Return HVAC options for the selected building using lists.csv 'as is'.
+
+    Strategy:
+    1) Find the 'HVAC Type, <Building>' column (handles variations like Hosp/MF).
+    2) If there's a 'Building Type' indicator column, filter rows to just this building.
+    3) Clean/unique options.
+    4) Apply a strict override list for building types where we know the exact,
+       allowed values (e.g., Office), to avoid cross-contamination from the sheet.
     """
     if lists_df is None or lists_df.empty:
         return []
 
-    # Map UI building names to tokens that may appear in headers
-    candidates = {
+    import re
+
+    # Map UI building names to tokens likely to appear in header or indicator cells
+    tokens_map = {
         "Office": ["office"],
         "Hotel": ["hotel"],
         "School": ["school", "sh"],
         "Hospital": ["hospital", "hosp"],
         "Multi-family": ["multi-family", "multifamily", "mf", "m-f"],
     }
-    tokens = candidates.get(building_label, [building_label.lower()])
+    tokens = tokens_map.get(building_label, [building_label.lower()])
 
-    # 1) Try exact pattern: "HVAC Type, <token>"
+    # --- 1) Locate the HVAC Type column for this building ---
+    hvac_col = None
     for c in lists_df.columns:
         c_norm = str(c).strip()
         if c_norm.lower().startswith("hvac type"):
-            for t in tokens:
-                if re.fullmatch(rf"(?i)hvac type[, ]+\s*{re.escape(t)}\s*", c_norm):
-                    return _clean_options(lists_df[c])
+            # exact: "HVAC Type, <token>"
+            if any(re.fullmatch(rf"(?i)hvac type[, ]+\s*{re.escape(t)}\s*", c_norm) for t in tokens):
+                hvac_col = c
+                break
+    if hvac_col is None:
+        # contains variant, e.g. "HVAC Type - Hospital"
+        for c in lists_df.columns:
+            c_norm = str(c).strip().lower()
+            if c_norm.startswith("hvac type") and any(t in c_norm for t in tokens):
+                hvac_col = c
+                break
+    if hvac_col is None:
+        return []
 
-    # 2) Fallback: any "HVAC Type" header that contains the token
-    for c in lists_df.columns:
-        c_norm = str(c).strip().lower()
-        if c_norm.startswith("hvac type") and any(t in c_norm for t in tokens):
-            return _clean_options(lists_df[c])
+    # --- 2) Optional: filter rows to this building if an indicator column exists ---
+    def find_building_key(df: pd.DataFrame):
+        # Look for a column that marks the building type per row
+        preferred = [
+            "Building Type", "Type of Building", "Bldg Type", "Building",
+            "Building_Type", "Type"
+        ]
+        cols_norm = {str(c).strip().lower(): c for c in df.columns}
+        for p in preferred:
+            if p.lower() in cols_norm:
+                return cols_norm[p.lower()]
+        # fallback: any col that contains both 'building' and 'type'
+        for c in df.columns:
+            lc = str(c).strip().lower()
+            if "building" in lc and "type" in lc:
+                return c
+        return None
 
-    return []
+    bkey = find_building_key(lists_df)
+    if bkey:
+        # keep rows where indicator mentions this building token
+        mask = lists_df[bkey].astype(str).str.lower().apply(
+            lambda s: any(t in s for t in tokens)
+        )
+        hvac_series = lists_df.loc[mask, hvac_col]
+    else:
+        hvac_series = lists_df[hvac_col]
+
+    # --- 3) Clean & de-dup while preserving order ---
+    def _clean(series):
+        if series is None or series.empty:
+            return []
+        s = series.dropna().astype(str).map(lambda x: x.strip())
+        vals = [x for x in s if x and x.lower() not in ("none", "nan")]
+        seen, ordered = set(), []
+        for x in vals:
+            if x not in seen:
+                ordered.append(x); seen.add(x)
+        return ordered
+
+    options = _clean(hvac_series)
+
+    # --- 4) Strict overrides for known building types (prevents sheet cross-bleed) ---
+    strict_allowed = {
+        "Office": [
+            "Packaged VAV with electric reheat",
+            "Packaged VAV with hydronic reheat",
+            "Built-up VAV with hydronic reheat",
+            "Other",
+        ],
+        # You can add per-building strict lists here as you finalize them:
+        # "Hotel": [...],
+        # "School": [...],
+        # "Hospital": [...],
+        # "Multi-family": [...],
+    }
+
+    if building_label in strict_allowed:
+        allowed = strict_allowed[building_label]
+        # case-insensitive match to keep original casing if found
+        lower_to_orig = {x.lower(): x for x in options}
+        filtered = []
+        for a in allowed:
+            found = lower_to_orig.get(a.lower())
+            filtered.append(found if found else a)
+        return filtered
+
+    # Otherwise, ensure 'Other' is present at the end
+    if not any(x.lower() == "other" for x in options):
+        options.append("Other")
+    return options
+
 
 # ------------------ 1) Project & Location ------------------
 st.header("1) Project & Location")
