@@ -23,18 +23,66 @@ lookup_df = load_savings_lookup()
 
 # --- Step 1: Project & Location ---
 st.header("1) Project & Location")
-# Build State and City options from weather_df
-state_col = [c for c in weather_df.columns if "state" in c.lower()][0]
-city_col = [c for c in weather_df.columns if "city" in c.lower()][0]
 
-states = sorted(weather_df[state_col].dropna().astype(str).unique().tolist())
+def find_col(df, *candidates):
+    cols = [str(c).strip() for c in df.columns]
+    lower = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    # fuzzy contains
+    for cand in candidates:
+        for c in cols:
+            if cand.lower() in c.lower():
+                return c
+    return None
+
+# Load weather (already done earlier via engine.load_weather)
+wdf = weather_df
+
+# Try flexible header matches
+state_col = find_col(wdf, "State")
+city_col  = find_col(wdf, "City")
+hdd_col   = find_col(wdf, "HDD", "Heating Degree Days", "Heating Degree Days (HDD)")
+cdd_col   = find_col(wdf, "CDD", "Cooling Degree Days", "Cooling Degree Days (CDD)")
+
+# Debug helper (optional): show what we resolved
+# st.caption(f"Resolved columns → State: {state_col}, City: {city_col}, HDD: {hdd_col}, CDD: {cdd_col}")
+
+# Guardrails
+missing = [name for name, col in [("State", state_col), ("City", city_col),
+                                  ("HDD", hdd_col), ("CDD", cdd_col)] if col is None]
+if missing:
+    st.error(f"weather_information.csv is missing these columns (or headers are unexpected): {', '.join(missing)}")
+    st.stop()
+
+# Build selectors
+states = sorted(wdf[state_col].dropna().astype(str).unique().tolist())
 state = st.selectbox("State", states)
 
-cities = sorted(weather_df[weather_df[state_col].astype(str) == state][city_col].dropna().astype(str).unique().tolist())
+cities = sorted(
+    wdf[wdf[state_col].astype(str) == state][city_col]
+    .dropna().astype(str).unique().tolist()
+)
 city = st.selectbox("City", cities)
 
+# Lookup HDD/CDD
+sel = wdf[(wdf[state_col].astype(str) == state) & (wdf[city_col].astype(str) == city)]
+if sel.empty:
+    st.error("Selected State/City not found in weather_information.csv.")
+    st.stop()
+
+hdd = float(sel[hdd_col].iloc[0])
+cdd = float(sel[cdd_col].iloc[0])
+
+col1, col2 = st.columns(2)
+with col1:
+    st.metric("Location HDD (base 65)", f"{hdd:.0f}")
+with col2:
+    st.metric("Location CDD (base 65)", f"{cdd:.0f}")
+
 elec_utility = st.text_input("Electric Utility (optional)")
-gas_utility = st.text_input("Natural Gas Utility (optional)")
+gas_utility  = st.text_input("Natural Gas Utility (optional)")
 
 # HDD/CDD auto
 hdd, cdd = compute_hdd_cdd(weather_df, state, city)
