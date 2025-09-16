@@ -25,18 +25,55 @@ lookup_df = load_savings_lookup()
 # --- Step 1: Project & Location ---
 st.header("1) Project & Location")
 
-def find_col(df, *candidates):
-    cols = [str(c).strip() for c in df.columns]
-    lower = {c.lower(): c for c in cols}
-    for cand in candidates:
-        if cand.lower() in lower:
-            return lower[cand.lower()]
-    # fuzzy contains
-    for cand in candidates:
-        for c in cols:
-            if cand.lower() in c.lower():
-                return c
-    return None
+# Use the exact headers your CSV exposes and ignore extra "None" columns
+REQUIRED_COLS = ["State", "Cities", "Heating Degree Days (HDD)", "Cooling Degree Days (CDD)"]
+missing = [c for c in REQUIRED_COLS if c not in weather_df.columns]
+if missing:
+    st.error(f"'data/weather_information.csv' is missing required columns: {', '.join(missing)}")
+    st.stop()
+
+# Keep only the columns we need and drop blank rows
+wdf = weather_df[REQUIRED_COLS].copy()
+wdf = wdf.dropna(subset=["State", "Cities"])  # make sure both exist
+# Normalize types/whitespace
+wdf["State"] = wdf["State"].astype(str).str.strip()
+wdf["Cities"] = wdf["Cities"].astype(str).str.strip()
+
+# Build selectors
+states = sorted(wdf["State"].unique().tolist())
+state = st.selectbox("State", states)
+
+cities = sorted(wdf.loc[wdf["State"] == state, "Cities"].unique().tolist())
+city = st.selectbox("City", cities)
+
+# Lookup HDD/CDD for the selected row
+sel = wdf[(wdf["State"] == state) & (wdf["Cities"] == city)]
+if sel.empty:
+    st.error("Selected State/City not found in weather_information.csv.")
+    st.stop()
+
+# Coerce numeric (handles strings like '3,456')
+def to_num(x):
+    try:
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return None
+
+hdd = to_num(sel["Heating Degree Days (HDD)"].iloc[0])
+cdd = to_num(sel["Cooling Degree Days (CDD)"].iloc[0])
+
+if hdd is None or cdd is None:
+    st.error("HDD/CDD values could not be parsed as numbers.")
+    st.stop()
+
+col1, col2 = st.columns(2)
+with col1:
+    st.metric("Location HDD (base 65)", f"{hdd:.0f}")
+with col2:
+    st.metric("Location CDD (base 65)", f"{cdd:.0f}")
+
+elec_utility = st.text_input("Electric Utility (optional)")
+gas_utility  = st.text_input("Natural Gas Utility (optional)")
 
 # Load weather (already done earlier via engine.load_weather)
 wdf = weather_df
