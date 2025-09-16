@@ -1,7 +1,13 @@
-
 import streamlit as st
 import pandas as pd
 from pathlib import Path
+import sys, os
+
+# >>> make sure repo root is on sys.path (…/app -> repo root)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+assert (REPO_ROOT / "engine" / "engine.py").exists(), f"engine.py not found at {REPO_ROOT/'engine'/'engine.py'}"
+
 from engine.engine import load_weather, load_lists, load_savings_lookup, compute_hdd_cdd
 
 st.set_page_config(page_title="CSW Savings Calculator (Prototype)", layout="wide")
