@@ -5,10 +5,8 @@ from pathlib import Path
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 def load_weather():
+    # Load the CSV exactly as committed in the repo
     df = pd.read_csv(DATA_DIR / "weather_information.csv")
-    # Expect columns: State, City, HDD, CDD (actual names depend on your sheet)
-    # Normalize column names to safe identifiers
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
     return df
 
 def load_lists():
