@@ -18,6 +18,7 @@ st.markdown("> **Preliminary estimates only.** For detailed results, a full ener
 
 # Load data
 weather_df = load_weather()
+st.caption("Weather CSV headers: " + ", ".join(map(str, weather_df.columns)))
 lists_df = load_lists()
 lookup_df = load_savings_lookup()
 
