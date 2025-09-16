@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 import sys
 import os
+import re
 
 # --- Ensure repo root is importable (…/app -> repo root) ---
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -26,8 +27,6 @@ DATA_DIR = REPO_ROOT / "data"
 
 @st.cache_data(show_spinner=False)
 def _load_weather_fallback():
-    # Expect exact file present in repo:
-    # data/weather_information.csv
     p = DATA_DIR / "weather_information.csv"
     if not p.exists():
         raise FileNotFoundError(f"Missing file: {p}")
@@ -37,7 +36,6 @@ def _load_weather_fallback():
 def _load_lists_fallback():
     p = DATA_DIR / "lists.csv"
     if not p.exists():
-        # Lists are optional for now; return empty DF if missing
         return pd.DataFrame()
     return pd.read_csv(p)
 
@@ -45,7 +43,6 @@ def _load_lists_fallback():
 def _load_lookup_fallback():
     p = DATA_DIR / "savings_lookup.csv"
     if not p.exists():
-        # We’ll wire this when we add the Office regression path
         return pd.DataFrame()
     return pd.read_csv(p)
 
@@ -68,10 +65,64 @@ except Exception as e:
     st.warning(f"Savings lookup not loaded: {e}")
     lookup_df = pd.DataFrame()
 
+# ------------------ Helpers ------------------
+def _to_num(x):
+    try:
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return None
+
+def _clean_options(series):
+    if series is None or series.empty:
+        return []
+    s = series.dropna().astype(str).map(lambda x: x.strip())
+    opts = [x for x in s if x and x.lower() not in ("none", "nan")]
+    # de-dup preserve order
+    seen, ordered = set(), []
+    for x in opts:
+        if x not in seen:
+            ordered.append(x); seen.add(x)
+    return ordered
+
+def hvac_options_for_building(lists_df: pd.DataFrame, building_label: str):
+    """
+    Reads lists.csv as-is and finds the column for HVAC types that matches the
+    selected building. Works with headers like 'HVAC Type, Office',
+    'HVAC Type, Hotel', 'HVAC Type, Hosp', 'HVAC Type, MF', etc.
+    """
+    if lists_df is None or lists_df.empty:
+        return []
+
+    # Map UI building names to tokens that may appear in headers
+    candidates = {
+        "Office": ["office"],
+        "Hotel": ["hotel"],
+        "School": ["school", "sh"],
+        "Hospital": ["hospital", "hosp"],
+        "Multi-family": ["multi-family", "multifamily", "mf", "m-f"],
+    }
+    tokens = candidates.get(building_label, [building_label.lower()])
+
+    # 1) Try exact pattern: "HVAC Type, <token>"
+    for c in lists_df.columns:
+        c_norm = str(c).strip()
+        if c_norm.lower().startswith("hvac type"):
+            for t in tokens:
+                if re.fullmatch(rf"(?i)hvac type[, ]+\s*{re.escape(t)}\s*", c_norm):
+                    return _clean_options(lists_df[c])
+
+    # 2) Fallback: any "HVAC Type" header that contains the token
+    for c in lists_df.columns:
+        c_norm = str(c).strip().lower()
+        if c_norm.startswith("hvac type") and any(t in c_norm for t in tokens):
+            return _clean_options(lists_df[c])
+
+    return []
+
 # ------------------ 1) Project & Location ------------------
 st.header("1) Project & Location")
 
-# Expect exact headers (from your caption):
+# Expect exact headers in weather_information.csv:
 REQ = ["State", "Cities", "Heating Degree Days (HDD)", "Cooling Degree Days (CDD)"]
 missing = [c for c in REQ if c not in weather_df.columns]
 if missing:
@@ -98,12 +149,6 @@ if sel.empty:
     st.error("Selected State/City not found in weather_information.csv.")
     st.stop()
 
-def _to_num(x):
-    try:
-        return float(str(x).replace(",", ""))
-    except Exception:
-        return None
-
 hdd = _to_num(sel["Heating Degree Days (HDD)"].iloc[0])
 cdd = _to_num(sel["Cooling Degree Days (CDD)"].iloc[0])
 if hdd is None or cdd is None:
@@ -122,12 +167,20 @@ gas_utility  = st.text_input("Natural Gas Utility (optional)")
 # ------------------ 2) Building ------------------
 st.header("2) Building")
 
-# (You can swap these with options pulled from lists_df when we map that)
 building_type = st.selectbox("Building Type", ["Office", "Hotel", "School", "Hospital", "Multi-family"])
 area = st.number_input("Building Area (ft²)", min_value=0.0, value=100000.0, step=1000.0, format="%.0f")
 floors = st.number_input("Number of Floors", min_value=1, value=3, step=1)
 
-hvac_type = st.selectbox("HVAC System Type", ["VAV", "Packaged RTU", "Heat Pump", "Boiler/Chiller"])
+# Dynamic HVAC options from lists.csv for the selected building
+hvac_dynamic_options = hvac_options_for_building(lists_df, building_type)
+fallback_hvac = ["VAV", "Packaged RTU", "Heat Pump", "Boiler/Chiller"]
+hvac_type = st.selectbox(
+    "HVAC System Type",
+    hvac_dynamic_options if hvac_dynamic_options else fallback_hvac,
+    help=("Options loaded from Lists for this building type."
+          if hvac_dynamic_options else "Lists column not found; showing fallback list.")
+)
+
 heating_fuel = st.selectbox("Heating Fuel", ["Elec", "Gas"])
 cooling_installed = st.selectbox("Cooling Installed?", ["Yes", "No"])
 annual_hours = st.number_input("Annual Operating Hours", min_value=0, max_value=8760, value=4000, step=100)
@@ -169,7 +222,6 @@ st.info(
     "will appear here once we wire the Office regression + Savings Lookup logic."
 )
 
-# Example of where results will go (for layout only)
 colA, colB, colC = st.columns(3)
 with colA:
     st.metric("Annual Electric Savings (kWh/yr)", "—")
@@ -193,7 +245,6 @@ if submitted:
     if not consent:
         st.warning("Please check the consent box so we can contact you.")
     else:
-        # Save to a temporary CSV on the server (ephemeral in Streamlit Cloud)
         lead = {
             "name": lc_name,
             "company": lc_company,
