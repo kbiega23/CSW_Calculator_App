@@ -1,14 +1,21 @@
-# app/streamlit_app.py
-import streamlit as st
-import pandas as pd
+# app/streamlit_app.py  (TOP OF FILE)
+import sys
 from pathlib import Path
 
+# Make repo root importable so `engine` works on Streamlit Cloud
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import streamlit as st
+import pandas as pd
 from engine.engine import load_weather, load_lists, compute_savings
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR.parent / "data"
 
 st.set_page_config(page_title="CSW Savings Calculator (Prototype)", layout="wide")
+
 
 # ---------------- Load data ----------------
 weather_df = load_weather()
