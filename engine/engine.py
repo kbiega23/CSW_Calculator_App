@@ -203,6 +203,46 @@ def _btag(bt: str, school_sub: Optional[str], mf_size: Optional[str]) -> str:
 def _inventory(df: pd.DataFrame, base: str, csw: str, tag: str) -> List[str]:
     return _prefix(df, f"{base}{csw}{tag}", 100)
 
+def _rowdbg(r: pd.Series) -> Dict[str, Any]:
+    return {
+        "LookKey": r.get("LookKey",""),
+        "ElecHeat_kWh_SF": _safe_num(r.get("ElecHeat_kWh_SF__num",0)),
+        "Cool_kWh_SF": _safe_num(r.get("Cool_kWh_SF__num",0)),
+        "GasHeat_therm_SF": _safe_num(r.get("GasHeat_therm_SF__num",0)),
+        "Cool_adjust": _safe_num(r.get("Cool_adjust__num",1.0)),
+        "Infil_Heat_Factor": _safe_num(r.get("Infil_Heat_Factor__num",1.0)),
+        "Infil_Cool_Factor": _safe_num(r.get("Infil_Cool_Factor__num",1.0)),
+        "Base_EUI": _safe_num(r.get("Base_EUI__num", math.nan), math.nan),
+        "CSW_EUI": _safe_num(r.get("CSW_EUI__num", math.nan), math.nan),
+    }
+
+def _debug_payload(
+    df: pd.DataFrame,
+    audit: Dict[str, Any],
+    attempted: List[str],
+    bt: str,
+    school_sub: Optional[str],
+    mf_size: Optional[str],
+    base: str,
+    csw: str,
+    prefix_hint: str,
+) -> Dict[str, Any]:
+    """Builds the debug dict when a LookKey miss occurs (and for UI panel)."""
+    btag = _btag(bt, school_sub, mf_size)
+    last_key = attempted[-1] if attempted else ""
+    # For suggestions, drop trailing digits (e.g., Office hour buckets)
+    prefix_for_suggest = re.sub(r"\d+$", "", prefix_hint)
+    return {
+        "attempted_keys": attempted,
+        "matched_keys": {},  # none; this is a miss path
+        "expected_building_prefix": f"{base}{csw}{btag}",
+        "inventory_keys_for_building_prefix": _inventory(df, base, csw, btag)[:50],
+        "prefix_used_for_suggestions": prefix_for_suggest,
+        "prefix_candidates": _prefix(df, prefix_for_suggest, 50),
+        "similar_keys": _similar(df, last_key, 20),
+        "csv_audit": audit,
+    }
+
 # ---------- main compute ----------
 def compute_savings(inp: Inputs) -> EngineResult:
     loaded = load_lookup()
@@ -237,7 +277,10 @@ def compute_savings(inp: Inputs) -> EngineResult:
         if r_lo is None and r_hi is not None: r_lo, lo_b, t = r_hi, hi_b, 0.0
         if r_hi is None and r_lo is not None: r_hi, hi_b, t = r_lo, lo_b, 0.0
         if r_lo is None or r_hi is None:
-            raise ValueError("no LookKey match.", _debug_payload(df, audit, attempted, bt, inp.school_subtype, mf_size, base, csw, f"{base}{csw}{size}Office{hvac}{fuel}"))
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, inp.school_subtype, mf_size, base, csw, f"{base}{csw}{size}Office{hvac}{fuel}")
+            )
         matched[k_lo] = _rowdbg(r_lo); matched[k_hi] = _rowdbg(r_hi)
         e = (1-t)*_safe_num(r_lo["ElecHeat_kWh_SF__num"]) + t*_safe_num(r_hi["ElecHeat_kWh_SF__num"])
         c = (1-t)*_safe_num(r_lo["Cool_kWh_SF__num"])     + t*_safe_num(r_hi["Cool_kWh_SF__num"])
@@ -256,7 +299,10 @@ def compute_savings(inp: Inputs) -> EngineResult:
         attempted.append(key)
         r = _row(df, key)
         if r is None:
-            raise ValueError("no LookKey match.", _debug_payload(df, audit, attempted, bt, inp.school_subtype, None, base, csw, f"{base}{csw}{subcode}{hvac}{fuel}"))
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, inp.school_subtype, None, base, csw, f"{base}{csw}{subcode}{hvac}{fuel}")
+            )
         matched[key] = _rowdbg(r)
         e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
         if not inp.cooling_installed: c *= _safe_num(r["Cool_adjust__num"],1.0)
@@ -270,7 +316,10 @@ def compute_savings(inp: Inputs) -> EngineResult:
         attempted.append(key)
         r = _row(df, key)
         if r is None:
-            raise ValueError("no LookKey match.", _debug_payload(df, audit, attempted, bt, None, None, base, csw, f"{base}{csw}{size}Hotel{hvac}{fuel}"))
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, None, None, base, csw, f"{base}{csw}{size}Hotel{hvac}{fuel}")
+            )
         matched[key] = _rowdbg(r)
         e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
         if not inp.cooling_installed: c *= _safe_num(r["Cool_adjust__num"],1.0)
@@ -282,7 +331,10 @@ def compute_savings(inp: Inputs) -> EngineResult:
         attempted.append(key)
         r = _row(df, key)
         if r is None:
-            raise ValueError("no LookKey match.", _debug_payload(df, audit, attempted, bt, None, None, base, csw, f"{base}{csw}Hosp{hvac}{fuel}"))
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, None, None, base, csw, f"{base}{csw}Hosp{hvac}{fuel}")
+            )
         matched[key] = _rowdbg(r)
         e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
         if not inp.cooling_installed: c *= _safe_num(r["Cool_adjust__num"],1.0)
@@ -297,7 +349,10 @@ def compute_savings(inp: Inputs) -> EngineResult:
         attempted.append(key)
         r = _row(df, key)
         if r is None:
-            raise ValueError("no LookKey match.", _debug_payload(df, audit, attempted, bt, None, size, base, csw, f"{base}{csw}{size}MF{hvac}{fuel}"))
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, None, size, base, csw, f"{base}{csw}{size}MF{hvac}{fuel}")
+            )
         matched[key] = _rowdbg(r)
         e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
         if inp.mf_infiltration_include is False:
@@ -323,6 +378,7 @@ def compute_savings(inp: Inputs) -> EngineResult:
     if not math.isnan(base_eui) and not math.isnan(csw_eui):
         eui_savings = base_eui - csw_eui
 
+    # Success-path debug (also useful)
     btag = _btag(bt, inp.school_subtype, mf_size)
     last_key = attempted[-1] if attempted else ""
     prefix_for_suggest = re.sub(r"\d+$","", last_key)
@@ -355,17 +411,3 @@ def compute_savings(inp: Inputs) -> EngineResult:
         },
         debug=debug,
     )
-
-# ---------- debug row pack ----------
-def _rowdbg(r: pd.Series) -> Dict[str, Any]:
-    return {
-        "LookKey": r.get("LookKey",""),
-        "ElecHeat_kWh_SF": _safe_num(r.get("ElecHeat_kWh_SF__num",0)),
-        "Cool_kWh_SF": _safe_num(r.get("Cool_kWh_SF__num",0)),
-        "GasHeat_therm_SF": _safe_num(r.get("GasHeat_therm_SF__num",0)),
-        "Cool_adjust": _safe_num(r.get("Cool_adjust__num",1.0)),
-        "Infil_Heat_Factor": _safe_num(r.get("Infil_Heat_Factor__num",1.0)),
-        "Infil_Cool_Factor": _safe_num(r.get("Infil_Cool_Factor__num",1.0)),
-        "Base_EUI": _safe_num(r.get("Base_EUI__num", math.nan), math.nan),
-        "CSW_EUI": _safe_num(r.get("CSW_EUI__num", math.nan), math.nan),
-    }
