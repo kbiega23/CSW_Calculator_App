@@ -1,22 +1,26 @@
-# app/streamlit_app.py  (TOP OF FILE)
+# app/streamlit_app.py
+import streamlit as st
+import pandas as pd
 from pathlib import Path
+from typing import Dict, List, Optional
 import sys
 
+# --- Make repo root importable (so "engine" is found when Streamlit runs /app) ---
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Prefer package import; fall back if __init__.py is missing
+# Prefer package import; fall back to module import if __init__.py is missing
 try:
     from engine import Inputs, compute_savings
 except Exception:
     from engine.engine import Inputs, compute_savings
 
-
-APP_DIR = Path(__file__).resolve().parents[1]
+APP_DIR = REPO_ROOT
 DATA_DIR = APP_DIR / "data"
 
 st.set_page_config(page_title="CSW Savings Calculator", page_icon="🪟", layout="centered")
+
 
 # ---------------------------
 # Helpers: data loading
