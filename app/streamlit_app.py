@@ -3,9 +3,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 
-from engine.engine import (
-    load_weather, load_lists, compute_savings
-)
+from engine.engine import load_weather, load_lists, compute_savings
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR.parent / "data"
@@ -25,7 +23,6 @@ def load_hvac_overrides() -> pd.DataFrame:
             if df[c].dtype == object:
                 df[c] = df[c].astype(str).str.strip()
         return df
-    # fallback: empty -> no filtering
     return pd.DataFrame(columns=["Building Type","Sub-Building Type","HVAC Option"])
 
 hvac_overrides_df = load_hvac_overrides()
@@ -54,7 +51,6 @@ def prev_step(): st.session_state.step = max(1, st.session_state.step - 1)
 
 # ---------------- Helpers ----------------
 def estimate_wwr(building_type: str, floors: int) -> float:
-    """Simple estimator (kept consistent with prior version you tested)."""
     bt = (building_type or "").lower()
     f = max(1, int(floors or 1))
     base = 0.25
@@ -63,9 +59,7 @@ def estimate_wwr(building_type: str, floors: int) -> float:
     elif bt == "hotel": base = 0.28
     elif bt == "hospital": base = 0.18
     elif "multi" in bt: base = 0.22
-    # mild increase with height, cap 0.6
-    wwr = min(0.60, base + 0.01 * max(0, f - 1))
-    return round(wwr, 3)
+    return min(0.60, round(base + 0.01 * max(0, f - 1), 3))
 
 def derive_sub_building_type(form: dict) -> str:
     bt = form.get("building_type")
@@ -82,7 +76,6 @@ def derive_sub_building_type(form: dict) -> str:
         return "Secondary School" if str(lvl).lower().startswith("secondary") else "Primary School"
 
     if bt == "Hotel":
-        # size derived after inputs: PTAC/PTHP => Small, else Large
         small = (hvac.startswith("ptac") or hvac.startswith("pthp"))
         return "Small Hotel" if small else "Large Hotel"
 
@@ -95,6 +88,7 @@ def derive_sub_building_type(form: dict) -> str:
     return ""
 
 def allowed_hvac_options(building_type: str, sub_building_type: str) -> list[str]:
+    # Primary source: overrides CSV
     if not hvac_overrides_df.empty:
         df = hvac_overrides_df
         m = (df["Building Type"].str.strip().str.lower() == (building_type or "").strip().lower())
@@ -103,7 +97,7 @@ def allowed_hvac_options(building_type: str, sub_building_type: str) -> list[str
         opts = df.loc[m, "HVAC Option"].dropna().astype(str).str.strip().unique().tolist()
         if opts:
             return opts
-    # fallback to lists.csv column for the building if present
+    # Fallback: lists.csv column that matches building
     hvac_col = None
     bt = (building_type or "").lower()
     for c in lists_df.columns:
@@ -111,7 +105,6 @@ def allowed_hvac_options(building_type: str, sub_building_type: str) -> list[str
             hvac_col = c; break
     if hvac_col is not None:
         return lists_df[hvac_col].dropna().astype(str).str.strip().unique().tolist()
-    # poorest fallback
     return ["Other"]
 
 # ---------------- UI ----------------
@@ -121,7 +114,6 @@ st.title("CSW Savings Calculator (Prototype)")
 if st.session_state.step == 1:
     st.header("Step 1 — Project Location")
 
-    # build state/city from weather_df
     state_col = "State" if "State" in weather_df.columns else [c for c in weather_df.columns if "state" in c.lower()][0]
     city_col  = "Cities" if "Cities" in weather_df.columns else [c for c in weather_df.columns if "city" in c.lower()][0]
     hdd_col   = "Heating Degree Days (HDD)"
@@ -159,7 +151,6 @@ elif st.session_state.step == 2:
     st.session_state.form["building_type"] = bt
 
     if bt == "School":
-        # Choose level on this step (per requirements)
         levels = ["Primary School","Secondary School"]
         lvl = st.radio("School Level", levels, index=(levels.index(st.session_state.form["school_level"]) if st.session_state.form["school_level"] in levels else 0), horizontal=True)
         st.session_state.form["school_level"] = lvl
@@ -204,25 +195,22 @@ elif st.session_state.step == 3:
             fuel = st.selectbox("Heating Fuel", ["Natural Gas","Electric","None"], index=(["Natural Gas","Electric","None"].index(form["heating_fuel"]) if form["heating_fuel"] in ["Natural Gas","Electric","None"] else 0))
             form["heating_fuel"] = fuel
         with col4:
-            # determine sub-type PREVIEW for allowed HVAC list (Office options are the same across mid/large in overrides, so this is safe)
             subtype_preview = derive_sub_building_type(form)
             hvac_choices = allowed_hvac_options("Office", subtype_preview)
             hvac = st.selectbox("HVAC System Type", hvac_choices, index=(hvac_choices.index(form["hvac"]) if form["hvac"] in hvac_choices else 0))
             form["hvac"] = hvac
 
     elif bt == "School":
-        # Level chosen in Step 2; no annual hours for school
         col3, col4 = st.columns(2)
         with col3:
             fuel = st.selectbox("Heating Fuel", ["Natural Gas","Electric","None"], index=(["Natural Gas","Electric","None"].index(form["heating_fuel"]) if form["heating_fuel"] in ["Natural Gas","Electric","None"] else 0))
             form["heating_fuel"] = fuel
-            # system options depend on Primary/Secondary
-            subtype_preview = derive_sub_building_type(form)
+            subtype_preview = derive_sub_building_type(form)  # Primary/Secondary from Step 2
             hvac_choices = allowed_hvac_options("School", subtype_preview)
             hvac = st.selectbox("HVAC System Type", hvac_choices, index=(hvac_choices.index(form["hvac"]) if form["hvac"] in hvac_choices else 0))
             form["hvac"] = hvac
         with col4:
-            pass  # room for future school-specific fields
+            pass
 
     elif bt == "Hotel":
         col3, col4 = st.columns(2)
@@ -232,7 +220,7 @@ elif st.session_state.step == 3:
             fuel = st.selectbox("Heating Fuel", ["Natural Gas","Electric","None"], index=(["Natural Gas","Electric","None"].index(form["heating_fuel"]) if form["heating_fuel"] in ["Natural Gas","Electric","None"] else 0))
             form["heating_fuel"] = fuel
         with col4:
-            subtype_preview = derive_sub_building_type(form)  # depends on selected HVAC
+            subtype_preview = derive_sub_building_type(form)  # depends on HVAC choice
             hvac_choices = allowed_hvac_options("Hotel", subtype_preview or "Small Hotel")
             hvac = st.selectbox("HVAC System Type", hvac_choices, index=(hvac_choices.index(form["hvac"]) if form["hvac"] in hvac_choices else 0))
             form["hvac"] = hvac
@@ -255,16 +243,16 @@ elif st.session_state.step == 3:
             infiltration = st.selectbox("Infiltration savings included?", ["Included","Excluded"], index=(["Included","Excluded"].index(form["mf_infiltration"]) if form["mf_infiltration"] in ["Included","Excluded"] else 0))
             form["mf_infiltration"] = infiltration
         with col4:
-            subtype_preview = derive_sub_building_type(form)  # Low vs Mid from floors
+            subtype_preview = derive_sub_building_type(form)  # Low vs Mid by floors
             hvac_choices = allowed_hvac_options("Multi-family", subtype_preview)
             hvac = st.selectbox("HVAC System Type", hvac_choices, index=(hvac_choices.index(form["hvac"]) if form["hvac"] in hvac_choices else 0))
             form["hvac"] = hvac
 
-    # Show WWR estimate (read-only)
+    # Read-only WWR estimate
     wwr = estimate_wwr(form.get("building_type"), form.get("floors"))
     st.caption(f"Estimated Window-to-Wall Ratio (WWR): **{wwr:.2f}**")
 
-    # Only display the derived sub-type AFTER inputs are provided (where applicable)
+    # Show derived sub-type AFTER inputs (where applicable)
     if bt in ("Office","Hotel","Multi-family"):
         sub_label = derive_sub_building_type(form)
         if sub_label:
@@ -312,7 +300,7 @@ else:
     bt = form.get("building_type")
     sub_type = derive_sub_building_type(form)
 
-    # Review summary (left)
+    # Review summary
     with st.expander("Review your inputs", expanded=True):
         left, right = st.columns(2)
         with left:
@@ -342,7 +330,7 @@ else:
             st.write(f"- CSW Installed Area: {form.get('csw_installed_sf')} sf")
             st.write(f"**Derived Sub-Building Type:** {sub_type or '(n/a)'}")
 
-    # Compute
+    # Compute (simple internal model)
     try:
         res = compute_savings(
             weather_hdd=float(form.get("hdd") or 0.0),
@@ -353,7 +341,7 @@ else:
             heating_fuel_ui=form.get("heating_fuel"),
             cooling_installed=(form.get("cooling_installed") == "Yes"),
             existing_window_type_ui=form.get("existing_window"),
-            csw_glazing_ui="Single",  # CSW analyzed type (can wire to UI later)
+            csw_glazing_ui="Single",  # can be wired later
             building_area_sf=float(form.get("area_sf") or 0.0),
             annual_operating_hours=float(form.get("annual_hours") or 0.0),
             hotel_occupancy_pct=float(form.get("hotel_occupancy") or 100.0),
@@ -375,12 +363,11 @@ else:
         with c2: st.metric("Cooling & Aux (kWh/sf)", f"{res['cool_kwh_per_sf']:.3f}")
         with c3: st.metric("Heating (therms/sf)", f"{res['gas_heat_therm_per_sf']:.4f}")
 
-        if res.get("eui_base") is not None or res.get("eui_csw") is not None:
-            st.subheader("Modeled EUI (from lookup)")
-            d1, d2, d3 = st.columns(3)
-            with d1: st.metric("Base EUI (kBtu/sf/yr)", f"{(res.get('eui_base') or 0):.1f}")
-            with d2: st.metric("CSW EUI (kBtu/sf/yr)", f"{(res.get('eui_csw') or 0):.1f}")
-            with d3: st.metric("EUI Savings (kBtu/sf/yr)", f"{(res.get('eui_savings_kbtusf') or 0):.1f}")
+        st.subheader("Modeled EUI (indicative only)")
+        d1, d2, d3 = st.columns(3)
+        with d1: st.metric("Base EUI (kBtu/sf/yr)", f"{(res.get('eui_base') or 0):.1f}")
+        with d2: st.metric("CSW EUI (kBtu/sf/yr)", f"{(res.get('eui_csw') or 0):.1f}")
+        with d3: st.metric("EUI Savings (kBtu/sf/yr)", f"{(res.get('eui_savings_kbtusf') or 0):.1f}")
 
         st.caption("Results are preliminary estimates; a full energy model is recommended for more accurate results.")
 
