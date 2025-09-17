@@ -1,500 +1,377 @@
 # app/streamlit_app.py
-from pathlib import Path
-import sys
-
-# --- Robust import of engine package (works on Streamlit Cloud) ---
-HERE = Path(__file__).resolve()
-for p in [HERE.parent, *HERE.parents]:
-    if (p / "engine" / "engine.py").exists():
-        if str(p) not in sys.path:
-            sys.path.insert(0, str(p))
-        break
-else:
-    raise RuntimeError(
-        "Couldn't find engine/engine.py. Ensure your repo has engine/engine.py at the root."
-    )
-
 import streamlit as st
 import pandas as pd
-from engine.engine import load_weather, load_lists, compute_savings
+from pathlib import Path
+from typing import Dict, List, Optional
 
-# --- Page config must be early ---
-st.set_page_config(page_title="CSW Savings Calculator (Prototype)", layout="wide")
+from engine.engine import Inputs, compute_savings
 
-APP_DIR = HERE.parent
-DATA_DIR = APP_DIR.parent / "data"
+APP_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = APP_DIR / "data"
 
-# ---------------- Load data ----------------
-weather_df = load_weather()
-lists_df   = load_lists()
+st.set_page_config(page_title="CSW Savings Calculator", page_icon="🪟", layout="centered")
 
+# ---------------------------
+# Helpers: data loading
+# ---------------------------
+
+@st.cache_data
+def load_weather() -> pd.DataFrame:
+    path = DATA_DIR / "weather_information.csv"
+    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    # Normalize likely headers: State, City/Cities, HDD, CDD
+    cols = {c.lower().strip(): c for c in df.columns}
+    def pick(*cands):
+        for c in cands:
+            if c in cols:
+                return cols[c]
+        return None
+    state_col = pick("state")
+    city_col  = pick("city", "cities")
+    hdd_col   = pick("hdd", "heatingdegreedays", "heating degree days")
+    cdd_col   = pick("cdd", "coolingdegreedays", "cooling degree days")
+    # fallback names
+    state_col = state_col or df.columns[0]
+    city_col = city_col or df.columns[1]
+    # coerce numeric to float where possible
+    for c in [hdd_col, cdd_col]:
+        if c and c in df.columns:
+            df[c] = pd.to_numeric(df[c].replace("", pd.NA), errors="coerce")
+    df = df.rename(columns={
+        state_col: "State",
+        city_col: "City",
+        hdd_col if hdd_col else "HDD": "HDD",
+        cdd_col if cdd_col else "CDD": "CDD",
+    })
+    return df
+
+@st.cache_data
+def load_lists() -> Dict[str, List[str]]:
+    # You can extend if needed. HVAC is overridden by hvac_overrides.csv
+    path = DATA_DIR / "lists.csv"
+    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    # Expect columns Category, Value
+    cat_col = next((c for c in df.columns if c.lower().strip() == "category"), df.columns[0])
+    val_col = next((c for c in df.columns if c.lower().strip() == "value"), df.columns[1])
+    out: Dict[str, List[str]] = {}
+    for cat, grp in df.groupby(cat_col):
+        vals = [v for v in grp[val_col].tolist() if v]
+        out[cat] = vals
+    return out
+
+@st.cache_data
 def load_hvac_overrides() -> pd.DataFrame:
-    p = DATA_DIR / "hvac_overrides.csv"
-    if p.exists():
-        df = pd.read_csv(p)
-        df.columns = [c.strip() for c in df.columns]
-        for c in df.columns:
-            if df[c].dtype == object:
-                df[c] = df[c].astype(str).str.strip()
-        return df
-    return pd.DataFrame(columns=["Building Type","Sub-Building Type","HVAC Option"])
+    path = DATA_DIR / "hvac_overrides.csv"
+    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    # Expect columns: BuildingType, SubType, HVACOption
+    # Normalize names
+    m = {c.lower().strip(): c for c in df.columns}
+    bt = m.get("buildingtype", list(df.columns)[0])
+    stype = m.get("subtype", list(df.columns)[1])
+    hvac = m.get("hvacoption", list(df.columns)[2])
+    return df.rename(columns={bt: "BuildingType", stype: "SubType", hvac: "HVACOption"})
 
-hvac_overrides_df = load_hvac_overrides()
+def allowed_hvac(building_type: str, subtype: str) -> List[str]:
+    """Filter HVAC options per hvac_overrides.csv, always include 'Other'."""
+    df = load_hvac_overrides()
+    subset = df[(df["BuildingType"] == building_type) & (df["SubType"] == subtype)]
+    opts = subset["HVACOption"].unique().tolist()
+    if "Other" not in opts:
+        opts.append("Other")
+    return opts or ["Other"]
 
-# ---------------- Session state ----------------
-def init_state():
-    if "step" not in st.session_state:
-        st.session_state.step = 1
-    if "form" not in st.session_state:
-        st.session_state.form = {
-            # Step 1
-            "state": None,
-            "city": None,
-            "hdd": None,
-            "cdd": None,
-            "elec_utility": "",
-            "gas_utility": "",
-            # Step 2
-            "building_type": None,
-            "school_level": None,  # Primary / Secondary (only for School)
-            # Step 3 (varies by building)
-            "area_sf": 0.0,
-            "floors": 1,
-            "annual_hours": 2912.0,  # only Office
-            "existing_window": "Single pane",
-            "hvac": "Other",
-            "heating_fuel": "Natural Gas",
-            "cooling_installed": "Yes",
-            "mf_infiltration": "Included",  # only MF
-            "hotel_occupancy": 100.0,       # only Hotel
-            # Step 4
-            "electric_rate": 0.12,
-            "gas_rate": 1.00,
-            "csw_installed_sf": 0.0,
-        }
+def mf_subtype_from_floors(floors: Optional[int]) -> str:
+    return "Low-rise Multifamily" if (floors is not None and floors < 4) else "Mid-rise Multifamily"
 
-def go_to(step: int):
-    st.session_state.step = max(1, min(5, int(step)))
+def office_subtype_preview(area_sf: float, hvac_label: str) -> str:
+    # IMPORTANT: This "preview" is only for filtering HVAC list if needed (both Office lists are identical anyway).
+    hvac_l = hvac_label.strip().lower()
+    size = "Large Office" if (area_sf > 30000 and "built-up vav" in hvac_l) else "Mid-size Office"
+    return size
 
-init_state()
+def hotel_subtype_preview(hvac_label: str) -> str:
+    s = hvac_label.strip().lower()
+    return "Small Hotel" if ("ptac" in s or "pthp" in s) else "Large Hotel"
 
-# ---------------- Helpers ----------------
-def estimate_wwr(building_type: str, floors: int) -> float:
-    bt = (building_type or "").lower()
-    f = max(1, int(floors or 1))
-    base = 0.25
-    if bt == "office": base = 0.30
-    elif bt == "school": base = 0.20
-    elif bt == "hotel": base = 0.28
-    elif bt == "hospital": base = 0.18
-    elif "multi" in bt: base = 0.22
-    return min(0.60, round(base + 0.01 * max(0, f - 1), 3))
+# ---------------------------
+# Wizard state
+# ---------------------------
 
-def derive_sub_building_type(form: dict) -> str:
-    bt = form.get("building_type")
-    floors = int(form.get("floors") or 0)
-    area = float(form.get("area_sf") or 0)
-    hvac = (form.get("hvac") or "").lower()
+if "step" not in st.session_state:
+    st.session_state.step = 1
 
-    if bt == "Office":
-        is_large = (area > 30000) and hvac.startswith("built-up vav")
-        return "Large Office" if is_large else "Mid-size Office"
+def next_step():
+    st.session_state.step += 1
 
-    if bt == "School":
-        lvl = form.get("school_level") or "Primary School"
-        return "Secondary School" if str(lvl).lower().startswith("secondary") else "Primary School"
+def prev_step():
+    st.session_state.step = max(1, st.session_state.step - 1)
 
-    if bt == "Hotel":
-        small = (hvac.startswith("ptac") or hvac.startswith("pthp"))
-        return "Small Hotel" if small else "Large Hotel"
+weather_df = load_weather()
+lists = load_lists()
 
-    if bt == "Hospital":
-        return "Hospital"
+# ---------------------------
+# Step 1: Location
+# ---------------------------
 
-    if bt in ("Multi-family","Multifamily","Multi family"):
-        return "Low-rise Multifamily" if floors < 4 else "Mid-rise Multifamily"
+st.title("CSW Savings Calculator")
 
-    return ""
-
-def allowed_hvac_options(building_type: str, sub_building_type: str) -> list[str]:
-    # Primary source: overrides CSV
-    if not hvac_overrides_df.empty:
-        df = hvac_overrides_df
-        m = (df["Building Type"].str.strip().str.lower() == (building_type or "").strip().lower())
-        if sub_building_type:
-            m &= (df["Sub-Building Type"].str.strip().str.lower() == sub_building_type.strip().lower())
-        opts = df.loc[m, "HVAC Option"].dropna().astype(str).str.strip().unique().tolist()
-        if opts:
-            return opts
-    # Fallback: lists.csv column that matches building
-    hvac_col = None
-    bt = (building_type or "").lower()
-    for c in lists_df.columns:
-        if c.strip().lower().startswith("hvac type") and bt in c.strip().lower():
-            hvac_col = c; break
-    if hvac_col is not None:
-        return lists_df[hvac_col].dropna().astype(str).str.strip().unique().tolist()
-    return ["Other"]
-
-def weather_columns(df: pd.DataFrame):
-    state_col = "State" if "State" in df.columns else [c for c in df.columns if "state" in c.lower()][0]
-    city_col  = "Cities" if "Cities" in df.columns else [c for c in df.columns if "city" in c.lower()][0]
-    hdd_col   = "Heating Degree Days (HDD)"
-    cdd_col   = "Cooling Degree Days (CDD)"
-    return state_col, city_col, hdd_col, cdd_col
-
-# ---------------- UI ----------------
-st.title("CSW Savings Calculator (Prototype)")
-
-# ---- STEP 1: Location & Utilities (form) ----
 if st.session_state.step == 1:
-    st.header("Step 1 — Project Location & Utilities")
+    st.header("1) Location")
+    states = sorted(weather_df["State"].unique().tolist())
+    state = st.selectbox("State", states, index=states.index("Colorado") if "Colorado" in states else 0, key="state")
+    cities = sorted(weather_df[weather_df["State"] == state]["City"].unique().tolist())
+    city = st.selectbox("City", cities, key="city")
+    row = weather_df[(weather_df["State"] == state) & (weather_df["City"] == city)].head(1)
+    hdd = float(row["HDD"].iloc[0]) if "HDD" in row.columns and not pd.isna(row["HDD"].iloc[0]) else 6500.0
+    cdd = float(row["CDD"].iloc[0]) if "CDD" in row.columns and not pd.isna(row["CDD"].iloc[0]) else 900.0
+    st.write(f"HDD: **{hdd:.0f}**, CDD: **{cdd:.0f}**")
 
-    with st.form("step1_form", clear_on_submit=False):
-        form = st.session_state.form
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Next ➜"):
+            st.session_state.location = {"state": state, "city": city, "hdd": hdd, "cdd": cdd}
+            next_step()
+    with col2:
+        st.button("Reset", on_click=lambda: st.session_state.clear())
 
-        state_col, city_col, hdd_col, cdd_col = weather_columns(weather_df)
+# ---------------------------
+# Step 2: Building Type
+# ---------------------------
 
-        states = sorted(weather_df[state_col].dropna().astype(str).unique().tolist())
-        prev_state = form.get("state")
-        s_idx = states.index(prev_state) if prev_state in states else 0
-        state = st.selectbox("State", states, index=s_idx, key="s1_state")
-
-        cities = sorted(
-            weather_df.loc[weather_df[state_col]==state, city_col].dropna().astype(str).unique().tolist()
-        )
-        prev_city = form.get("city")
-        c_idx = cities.index(prev_city) if prev_city in cities else 0
-        city = st.selectbox("City", cities, index=c_idx, key="s1_city")
-
-        # Resolve HDD/CDD
-        row = weather_df[(weather_df[state_col]==state) & (weather_df[city_col]==city)].iloc[0]
-        hdd, cdd = float(row[hdd_col]), float(row[cdd_col])
-
-        col1, col2 = st.columns(2)
-        with col1: st.metric("Location HDD (base 65)", f"{hdd:.0f}")
-        with col2: st.metric("Location CDD (base 65)", f"{cdd:.0f}")
-
-        # Optional utility names (these were present before)
-        col3, col4 = st.columns(2)
-        with col3:
-            elec_util = st.text_input("Electric Utility (optional)", value=form.get("elec_utility") or "", key="s1_elec_util")
-        with col4:
-            gas_util = st.text_input("Natural Gas Utility (optional)", value=form.get("gas_utility") or "", key="s1_gas_util")
-
-        nav = st.columns([1,1])
-        with nav[0]:
-            back = st.form_submit_button("← Back", use_container_width=True)
-        with nav[1]:
-            nxt = st.form_submit_button("Next →", use_container_width=True)
-
-        # Persist after submit
-        if nxt or back:
-            form["state"] = state
-            form["city"] = city
-            form["hdd"] = hdd
-            form["cdd"] = cdd
-            form["elec_utility"] = elec_util
-            form["gas_utility"]  = gas_util
-            if nxt:
-                go_to(2)
-            elif back:
-                go_to(1)
-
-# ---- STEP 2: Building Type (+ school level) (form) ----
 elif st.session_state.step == 2:
-    st.header("Step 2 — Building Type")
-    form = st.session_state.form
+    st.header("2) Building Type")
+    btypes = ["Office", "School", "Hotel", "Hospital", "Multi-family"]
+    btype = st.selectbox("Building Type", btypes, key="btype")
+    school_sub = None
+    if btype == "School":
+        school_sub = st.radio("School Sub-type", ["Primary", "Secondary"], horizontal=True, key="school_sub")
 
-    with st.form("step2_form", clear_on_submit=False):
-        building_types = ["Office","School","Hotel","Hospital","Multi-family"]
-        prev_bt = form.get("building_type")
-        bt_idx = building_types.index(prev_bt) if prev_bt in building_types else 0
-        bt = st.selectbox("Select Building Type", building_types, index=bt_idx, key="s2_bt")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("◀ Back"):
+            prev_step()
+    with col2:
+        if st.button("Next ➜"):
+            st.session_state.btype = {"building_type": btype, "school_subtype": school_sub}
+            next_step()
 
-        # School level inline (only for School)
-        if bt == "School":
-            levels = ["Primary School","Secondary School"]
-            prev_lvl = form.get("school_level")
-            lvl_idx = levels.index(prev_lvl) if prev_lvl in levels else 0
-            lvl = st.radio("School Level", levels, index=lvl_idx, horizontal=True, key="s2_school_level")
-        else:
-            lvl = None
+# ---------------------------
+# Step 3: Building Details
+# ---------------------------
 
-        nav = st.columns([1,1])
-        with nav[0]:
-            back = st.form_submit_button("← Back", use_container_width=True)
-        with nav[1]:
-            nxt = st.form_submit_button("Next →", use_container_width=True)
-
-        if nxt or back:
-            form["building_type"] = bt
-            form["school_level"]  = lvl
-            if nxt:
-                go_to(3)
-            elif back:
-                go_to(1)
-
-# ---- STEP 3: Building Details (varies by type) (form) ----
 elif st.session_state.step == 3:
-    st.header("Step 3 — Building Details")
-    form = st.session_state.form
-    bt = form.get("building_type")
+    st.header("3) Building Details")
 
-    if not bt:
-        st.warning("Please choose a Building Type in Step 2.")
-        if st.button("← Back to Step 2", key="s3_back_warn"):
-            go_to(2)
-        st.stop()
+    btype = st.session_state.btype["building_type"]
+    school_sub = st.session_state.btype.get("school_subtype")
 
-    with st.form("step3_form", clear_on_submit=False):
-        # Common inputs
-        col1, col2 = st.columns(2)
-        with col1:
-            area_sf = st.number_input("Building Area (sf)", min_value=0.0, value=float(form.get("area_sf") or 0.0), step=1000.0, format="%.0f", key="s3_area")
-            floors = st.number_input("Number of Floors", min_value=1, value=int(form.get("floors") or 1), step=1, key="s3_floors")
-        with col2:
-            existing = st.selectbox("Type of Existing Window", ["Single pane","Double pane"],
-                                    index=(["Single pane","Double pane"].index(form.get("existing_window")) if form.get("existing_window") in ["Single pane","Double pane"] else 0),
-                                    key="s3_existing")
-            cooling = st.selectbox("Cooling installed?", ["Yes","No"],
-                                   index=(["Yes","No"].index(form.get("cooling_installed")) if form.get("cooling_installed") in ["Yes","No"] else 0),
-                                   key="s3_cooling")
+    # Common inputs
+    area_sf = st.number_input("Building floor area (sf)", min_value=0.0, value=50000.0, step=1000.0, key="area")
+    floors = st.number_input("Number of floors", min_value=1, value=3, step=1, key="floors")
 
-        # Type-specific inputs
-        if bt == "Office":
-            col3, col4 = st.columns(2)
-            with col3:
-                annual_hours = st.number_input("Annual Operating Hours", min_value=0.0, value=float(form.get("annual_hours") or 2912.0), step=100.0, format="%.0f", key="s3_hours")
-                fuel = st.selectbox("Heating Fuel", ["Natural Gas","Electric","None"],
-                                    index=(["Natural Gas","Electric","None"].index(form.get("heating_fuel")) if form.get("heating_fuel") in ["Natural Gas","Electric","None"] else 0),
-                                    key="s3_fuel")
-            with col4:
-                # Subtype preview (after inputs) and HVAC options bound to subtype
-                tmp_form = form.copy()
-                tmp_form.update({"area_sf": area_sf, "floors": floors, "hvac": form.get("hvac")})
-                subtype_preview = derive_sub_building_type(tmp_form)
-                hvac_choices = allowed_hvac_options("Office", subtype_preview or "Mid-size Office")
-                hvac = st.selectbox("HVAC System Type", hvac_choices,
-                                    index=(hvac_choices.index(form.get("hvac")) if form.get("hvac") in hvac_choices else 0),
-                                    key="s3_hvac")
+    # Existing window
+    existing_win = st.selectbox("Existing window type", ["Single pane", "Double pane"], index=0, key="exist_win")
 
-        elif bt == "School":
-            col3, col4 = st.columns(2)
-            with col3:
-                fuel = st.selectbox("Heating Fuel", ["Natural Gas","Electric","None"],
-                                    index=(["Natural Gas","Electric","None"].index(form.get("heating_fuel")) if form.get("heating_fuel") in ["Natural Gas","Electric","None"] else 0),
-                                    key="s3_fuel")
-            with col4:
-                subtype_preview = derive_sub_building_type({**form, "floors": floors})
-                hvac_choices = allowed_hvac_options("School", subtype_preview)
-                hvac = st.selectbox("HVAC System Type", hvac_choices,
-                                    index=(hvac_choices.index(form.get("hvac")) if form.get("hvac") in hvac_choices else 0),
-                                    key="s3_hvac")
-            annual_hours = form.get("annual_hours", 0.0)  # not used for School
+    # Heating fuel (constrained)
+    heat_fuel = st.selectbox("Primary heating fuel", ["Natural Gas", "Electric", "None"], index=0, key="fuel")
 
-        elif bt == "Hotel":
-            col3, col4 = st.columns(2)
-            with col3:
-                occ = st.number_input("Average Occupancy Rate (%)", min_value=0.0, max_value=100.0, value=float(form.get("hotel_occupancy") or 100.0), step=1.0, format="%.0f", key="s3_occ")
-                fuel = st.selectbox("Heating Fuel", ["Natural Gas","Electric","None"],
-                                    index=(["Natural Gas","Electric","None"].index(form.get("heating_fuel")) if form.get("heating_fuel") in ["Natural Gas","Electric","None"] else 0),
-                                    key="s3_fuel")
-            with col4:
-                tmp_form = form.copy()
-                tmp_form.update({"hvac": form.get("hvac")})
-                subtype_preview = derive_sub_building_type(tmp_form)
-                hvac_choices = allowed_hvac_options("Hotel", subtype_preview or "Small Hotel")
-                hvac = st.selectbox("HVAC System Type", hvac_choices,
-                                    index=(hvac_choices.index(form.get("hvac")) if form.get("hvac") in hvac_choices else 0),
-                                    key="s3_hvac")
-            annual_hours = form.get("annual_hours", 0.0)
+    # Cooling installed?
+    cooling_installed = st.radio("Cooling installed?", ["Yes", "No"], horizontal=True, index=0, key="cooling")
+    cooling_installed_flag = (cooling_installed == "Yes")
 
-        elif bt == "Hospital":
-            col3, col4 = st.columns(2)
-            with col3:
-                fuel = st.selectbox("Heating Fuel", ["Natural Gas","Electric","None"],
-                                    index=(["Natural Gas","Electric","None"].index(form.get("heating_fuel")) if form.get("heating_fuel") in ["Natural Gas","Electric","None"] else 0),
-                                    key="s3_fuel")
-            with col4:
-                hvac_choices = allowed_hvac_options("Hospital", "Hospital")
-                hvac = st.selectbox("HVAC System Type", hvac_choices,
-                                    index=(hvac_choices.index(form.get("hvac")) if form.get("hvac") in hvac_choices else 0),
-                                    key="s3_hvac")
-            annual_hours = form.get("annual_hours", 0.0)
+    # Annual hours vs. occupancy vs. infiltration toggles vary by type
+    annual_hours = None
+    occupancy = None
+    mf_infil_include = True
 
-        else:  # Multi-family
-            col3, col4 = st.columns(2)
-            with col3:
-                fuel = st.selectbox("Heating Fuel", ["Natural Gas","Electric","None"],
-                                    index=(["Natural Gas","Electric","None"].index(form.get("heating_fuel")) if form.get("heating_fuel") in ["Natural Gas","Electric","None"] else 0),
-                                    key="s3_fuel")
-                infiltration = st.selectbox("Infiltration savings included?", ["Included","Excluded"],
-                                            index=(["Included","Excluded"].index(form.get("mf_infiltration")) if form.get("mf_infiltration") in ["Included","Excluded"] else 0),
-                                            key="s3_infil")
-            with col4:
-                subtype_preview = derive_sub_building_type({**form, "floors": floors})
-                hvac_choices = allowed_hvac_options("Multi-family", subtype_preview)
-                hvac = st.selectbox("HVAC System Type", hvac_choices,
-                                    index=(hvac_choices.index(form.get("hvac")) if form.get("hvac") in hvac_choices else 0),
-                                    key="s3_hvac")
-            annual_hours = form.get("annual_hours", 0.0)
+    # HVAC options (filtered by hvac_overrides.csv)
+    subtype_for_hvac = {
+        "Office": office_subtype_preview(area_sf, "Built-up VAV with hydronic reheat"),  # list is same for Mid/Large
+        "School": f"{school_sub} School" if btype == "School" else "",
+        "Hotel": hotel_subtype_preview("PTAC"),
+        "Hospital": "Hospital",
+        "Multi-family": mf_subtype_from_floors(floors),
+    }[btype]
 
-        # WWR (read-only) + Derived subtype after inputs
-        wwr = estimate_wwr(bt, floors)
-        st.caption(f"Estimated Window-to-Wall Ratio (WWR): **{wwr:.2f}**")
+    # If MF, let floors drive subtype; for Office & Hotel, lists are identical across sizes
+    if btype == "Multi-family":
+        subtype_for_hvac = mf_subtype_from_floors(floors)
+        mf_infil_include = st.checkbox("Include infiltration savings?", value=True, key="mf_infil")
 
-        sub_label = (
-            "Hospital" if bt == "Hospital"
-            else derive_sub_building_type({
-                **form,
+    hvac_opts = allowed_hvac(btype, subtype_for_hvac)
+
+    if btype == "Office":
+        annual_hours = st.number_input("Annual operating hours", min_value=0.0, value=3000.0, step=100.0, key="hours")
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+    elif btype == "School":
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+    elif btype == "Hotel":
+        occupancy = st.slider("Average occupancy (%)", min_value=0, max_value=100, value=70, step=5, key="occ")
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+    elif btype == "Hospital":
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+    elif btype == "Multi-family":
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("◀ Back"):
+            prev_step()
+    with col2:
+        if st.button("Next ➜"):
+            st.session_state.details = {
                 "area_sf": area_sf,
-                "floors": floors,
-                "hvac": hvac
-            })
-        )
-        if bt == "School":
-            st.info(f"School Level: **{form.get('school_level') or 'Primary School'}**")
-        else:
-            st.info(f"Derived Sub-Building Type: **{sub_label}**")
+                "floors": int(floors),
+                "annual_hours": annual_hours,
+                "occupancy": occupancy,
+                "existing_window": existing_win,
+                "hvac": hvac,
+                "heating_fuel": heat_fuel,
+                "cooling_installed": cooling_installed_flag,
+                "mf_infil_include": mf_infil_include,
+            }
+            next_step()
 
-        nav = st.columns([1,1])
-        with nav[0]:
-            back = st.form_submit_button("← Back", use_container_width=True)
-        with nav[1]:
-            nxt = st.form_submit_button("Next →", use_container_width=True)
+# ---------------------------
+# Step 4: Rates & Scope
+# ---------------------------
 
-        if nxt or back:
-            form["area_sf"] = area_sf
-            form["floors"] = floors
-            form["existing_window"] = existing
-            form["cooling_installed"] = cooling
-            form["heating_fuel"] = fuel
-            form["hvac"] = hvac
-            if bt == "Hotel":
-                form["hotel_occupancy"] = float(st.session_state.get("s3_occ", form.get("hotel_occupancy") or 100.0))
-            if bt == "Office":
-                form["annual_hours"] = float(st.session_state.get("s3_hours", form.get("annual_hours") or 2912.0))
-            if bt not in ("Multi-family","Multifamily","Multi family"):
-                form["mf_infiltration"] = form.get("mf_infiltration", "Included")
-            if nxt:
-                go_to(4)
-            elif back:
-                go_to(2)
-
-# ---- STEP 4: Rates & Scope (form) ----
 elif st.session_state.step == 4:
-    st.header("Step 4 — Energy Rates & CSW Scope")
-    form = st.session_state.form
+    st.header("4) Rates & Scope")
 
-    with st.form("step4_form", clear_on_submit=False):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            er = st.number_input("Electric Rate ($/kWh)", min_value=0.0, value=float(form.get("electric_rate") or 0.12), step=0.01, format="%.3f", key="s4_er")
-        with col2:
-            gr = st.number_input("Natural Gas Rate ($/therm)", min_value=0.0, value=float(form.get("gas_rate") or 1.00), step=0.05, format="%.3f", key="s4_gr")
-        with col3:
-            csw_sf = st.number_input("CSW Installed Area (sf)", min_value=0.0, value=float(form.get("csw_installed_sf") or 0.0), step=500.0, format="%.0f", key="s4_csw")
+    elec_rate = st.number_input("Electricity rate ($/kWh)", min_value=0.0, value=0.14, step=0.01, format="%.4f", key="erate")
+    gas_rate = st.number_input("Natural Gas rate ($/therm)", min_value=0.0, value=1.20, step=0.05, format="%.4f", key="grate")
+    csw_area = st.number_input("CSW installed area (sf) — leave 0 to use building area", min_value=0.0, value=0.0, step=100.0, key="csw_area")
 
-        nav = st.columns([1,1])
-        with nav[0]:
-            back = st.form_submit_button("← Back", use_container_width=True)
-        with nav[1]:
-            nxt = st.form_submit_button("Next →", use_container_width=True)
+    csw_panes = st.radio("CSW glazing", ["Double", "Single"], index=0, horizontal=True, key="csw_panes")
 
-        if nxt or back:
-            form["electric_rate"] = float(st.session_state.get("s4_er", form.get("electric_rate") or 0.12))
-            form["gas_rate"]      = float(st.session_state.get("s4_gr", form.get("gas_rate") or 1.00))
-            form["csw_installed_sf"] = float(st.session_state.get("s4_csw", form.get("csw_installed_sf") or 0.0))
-            if nxt:
-                go_to(5)
-            elif back:
-                go_to(3)
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("◀ Back"):
+            prev_step()
+    with col2:
+        if st.button("Next ➜"):
+            st.session_state.rates = {
+                "elec_rate": float(elec_rate),
+                "gas_rate": float(gas_rate),
+                "csw_area": float(csw_area),
+                "csw_panes": csw_panes,
+            }
+            next_step()
 
-# ---- STEP 5: Review & Results (no form) ----
+# ---------------------------
+# Step 5: Review & Results
+# ---------------------------
+
 else:
-    st.header("Step 5 — Review & Results")
+    st.header("5) Review & Results")
 
-    form = st.session_state.form
-    bt = form.get("building_type")
-    sub_type = derive_sub_building_type(form)
+    # Gather inputs
+    loc = st.session_state.location
+    bt = st.session_state.btype
+    det = st.session_state.details
+    rt = st.session_state.rates
 
-    with st.expander("Review your inputs", expanded=True):
-        left, right = st.columns(2)
-        with left:
-            st.write("**Location**")
-            st.write(f"- {form.get('city')}, {form.get('state')}")
-            st.write(f"- HDD: {form.get('hdd')} | CDD: {form.get('cdd')}")
-            st.write("**Utilities**")
-            st.write(f"- Electric Utility: {form.get('elec_utility') or '—'}")
-            st.write(f"- Natural Gas Utility: {form.get('gas_utility') or '—'}")
-            st.write("**Building**")
-            st.write(f"- Type: {bt}")
-            if bt == "School":
-                st.write(f"- School Level: {form.get('school_level')}")
-            st.write(f"- Area: {form.get('area_sf')} sf  |  Floors: {form.get('floors')}")
-            if bt == "Office":
-                st.write(f"- Annual Hours: {form.get('annual_hours')}")
-            if bt == "Hotel":
-                st.write(f"- Occupancy: {form.get('hotel_occupancy')}%")
-        with right:
-            st.write("**Envelope & Systems**")
-            st.write(f"- Existing Window: {form.get('existing_window')}")
-            st.write(f"- HVAC System: {form.get('hvac')}")
-            st.write(f"- Heating Fuel: {form.get('heating_fuel')}")
-            st.write(f"- Cooling Installed: {form.get('cooling_installed')}")
-            if "multi" in (bt or "").lower():
-                st.write(f"- Infiltration Savings: {form.get('mf_infiltration')}")
-            st.write("**Rates & Scope**")
-            st.write(f"- Elec Rate: ${form.get('electric_rate')} / kWh")
-            st.write(f"- Gas Rate: ${form.get('gas_rate')} / therm")
-            st.write(f"- CSW Installed Area: {form.get('csw_installed_sf')} sf")
-            st.write(f"**Derived Sub-Building Type:** {sub_type or '(n/a)'}")
+    inp = Inputs(
+        state=loc["state"],
+        city=loc["city"],
+        hdd=loc["hdd"],
+        cdd=loc["cdd"],
+        building_type=bt["building_type"],
+        school_subtype=bt.get("school_subtype"),
+        area_sf=det["area_sf"],
+        floors=det["floors"],
+        annual_hours=det.get("annual_hours"),
+        occupancy_rate_pct=det.get("occupancy"),
+        existing_window=det["existing_window"],
+        hvac_label=det["hvac"],
+        heating_fuel_label=det["heating_fuel"],
+        cooling_installed=det["cooling_installed"],
+        mf_infiltration_include=det["mf_infil_include"],
+        elec_rate_per_kwh=rt["elec_rate"],
+        gas_rate_per_therm=rt["gas_rate"],
+        csw_installed_area_sf=rt["csw_area"],
+        csw_panes=rt["csw_panes"],
+    )
 
-    # Compute using the internal placeholder model (same as before)
+    err_block = st.empty()
+    result_block = st.container()
+
     try:
-        res = compute_savings(
-            weather_hdd=float(form.get("hdd") or 0.0),
-            weather_cdd=float(form.get("cdd") or 0.0),
-            building_type=bt,
-            sub_building_type=sub_type,
-            hvac_ui=form.get("hvac"),
-            heating_fuel_ui=form.get("heating_fuel"),
-            cooling_installed=(form.get("cooling_installed") == "Yes"),
-            existing_window_type_ui=form.get("existing_window"),
-            csw_glazing_ui="Single",  # future hook
-            building_area_sf=float(form.get("area_sf") or 0.0),
-            annual_operating_hours=float(form.get("annual_hours") or 0.0),
-            hotel_occupancy_pct=float(form.get("hotel_occupancy") or 100.0),
-            include_infiltration=(form.get("mf_infiltration") != "Excluded"),
-            floors=int(form.get("floors") or 0),
-            csw_installed_sf=float(form.get("csw_installed_sf") or 0.0),
-            electric_rate=float(form.get("electric_rate") or 0.0),
-            gas_rate=float(form.get("gas_rate") or 0.0),
-        )
+        res = compute_savings(inp)
+        with result_block:
+            st.subheader("Savings Summary")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Electric heat savings (kWh)", f"{res.totals['elec_kwh']:,}")
+                st.metric("Cooling savings (kWh)", f"{res.totals['cool_kwh']:,}")
+            with c2:
+                st.metric("Gas heat savings (therms)", f"{res.totals['gas_therms']:,}")
+                st.metric("Total kWh", f"{res.totals['total_kwh']:,}")
+            with c3:
+                st.metric("Total therms", f"{res.totals['total_therms']:,}")
+                st.metric("Estimated cost savings", f"${res.totals['cost_savings']:,}")
+            st.caption(f"Area used for totals: **{res.totals['area_used_sf']:.0f} sf**")
 
-        k1, k2, k3 = st.columns(3)
-        with k1: st.metric("Electric Savings (kWh/yr)", f"{res['total_kwh']:,.0f}")
-        with k2: st.metric("Gas Savings (therms/yr)", f"{res['total_therms']:,.0f}")
-        with k3: st.metric("Estimated Cost Savings ($/yr)", f"${res['cost_savings_usd']:,.0f}")
+            st.markdown("**Per-square-foot savings**")
+            st.table(pd.DataFrame([res.per_sf]))
 
-        st.subheader("Per-SF Savings (applied to CSW installed area)")
-        c1, c2, c3 = st.columns(3)
-        with c1: st.metric("Heating (kWh/sf)", f"{res['elec_heat_kwh_per_sf']:.3f}")
-        with c2: st.metric("Cooling & Aux (kWh/sf)", f"{res['cool_kwh_per_sf']:.3f}")
-        with c3: st.metric("Heating (therms/sf)", f"{res['gas_heat_therm_per_sf']:.4f}")
+            st.markdown("**EUI (if available in CSV)**")
+            st.table(pd.DataFrame([res.eui]))
 
-        st.subheader("Modeled EUI (indicative only)")
-        d1, d2, d3 = st.columns(3)
-        with d1: st.metric("Base EUI (kBtu/sf/yr)", f"{(res.get('eui_base') or 0):.1f}")
-        with d2: st.metric("CSW EUI (kBtu/sf/yr)", f"{(res.get('eui_csw') or 0):.1f}")
-        with d3: st.metric("EUI Savings (kBtu/sf/yr)", f"{(res.get('eui_savings_kbtusf') or 0):.1f}")
+        # --- Debug panel ---
+        with st.expander("🔎 Debug panel (LookKey tracing)"):
+            st.markdown("**Attempted LookKey(s)**")
+            st.code("\n".join(res.debug["attempted_keys"]) or "(none)")
 
-        st.caption("Results are preliminary estimates; a full energy model is recommended for more accurate results.")
+            st.markdown("**Matched rows (values parsed)**")
+            if res.debug["matched_keys"]:
+                st.json(res.debug["matched_keys"])
+            else:
+                st.write("(no matches)")
+
+            st.markdown("**CSV audit**")
+            st.json(res.debug["csv_audit"])
+
+            st.markdown("**Expected building prefix**")
+            st.code(res.debug["expected_building_prefix"])
+
+            st.markdown("**Inventory for this building prefix (top 50)**")
+            st.code("\n".join(res.debug["inventory_keys_for_building_prefix"]) or "(none)")
+
+            st.markdown("**Prefix used for suggestions**")
+            st.code(res.debug["prefix_used_for_suggestions"])
+
+            st.markdown("**Keys starting with that prefix (top 50)**")
+            st.code("\n".join(res.debug["prefix_candidates"]) or "(none)")
+
+            st.markdown("**Similar keys (fuzzy matches)**")
+            st.code("\n".join(res.debug["similar_keys"]) or "(none)")
 
     except Exception as e:
-        st.error(f"Could not compute savings for the selected combination: {e}")
+        # If engine raised with a debug payload in args[1], show it
+        with err_block.container():
+            st.error(f"Could not compute savings for the selected combination: {getattr(e, 'args', [''])[0]}")
+            if len(getattr(e, "args", [])) > 1 and isinstance(e.args[1], dict):
+                dbg = e.args[1]
+                with st.expander("🔎 Debug panel (LookKey tracing)"):
+                    st.markdown("**Attempted LookKey(s)**")
+                    st.code("\n".join(dbg.get("attempted_keys", [])) or "(none)")
+                    st.markdown("**CSV audit**")
+                    st.json(dbg.get("csv_audit", {}))
+                    st.markdown("**Expected building prefix**")
+                    st.code(dbg.get("expected_building_prefix", ""))
+                    st.markdown("**Inventory for this building prefix (top 50)**")
+                    st.code("\n".join(dbg.get("inventory_keys_for_building_prefix", [])) or "(none)")
+                    st.markdown("**Prefix used for suggestions**")
+                    st.code(dbg.get("prefix_used_for_suggestions", ""))
+                    st.markdown("**Keys starting with that prefix (top 50)**")
+                    st.code("\n".join(dbg.get("prefix_candidates", [])) or "(none)")
+                    st.markdown("**Similar keys (fuzzy matches)**")
+                    st.code("\n".join(dbg.get("similar_keys", [])) or "(none)")
 
-    st.divider()
-    if st.button("← Back", key="s5_back"):
-        go_to(4)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.button("◀ Back", on_click=prev_step)
+    with col2:
+        st.button("Start Over", on_click=lambda: st.session_state.clear())
