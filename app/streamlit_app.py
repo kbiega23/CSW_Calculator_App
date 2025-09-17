@@ -1,441 +1,413 @@
-# app/streamlit_app.py
+# engine/engine.py
 from __future__ import annotations
-
-import streamlit as st
-import pandas as pd
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional
-import sys
-import re
+from typing import Any, Dict, List, Optional, Tuple
+import math, re, difflib
+import pandas as pd
 
-# ================== Setup & Imports ==================
-# Make repo root importable so "engine" works when Streamlit launches from /app
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+LOOKUP_CSV = DATA_DIR / "savings_lookup.csv"
 
-# Prefer package import; fall back to module import if __init__.py is missing
-try:
-    from engine import Inputs, compute_savings
-except Exception:
-    from engine.engine import Inputs, compute_savings  # fallback
+HOURS_BUCKETS = [2080, 2912, 8760]
+HOTEL_OCCUPANCY_BUCKET = 100
+PTHP_HDD_SPLIT = 7999
 
-APP_DIR = REPO_ROOT
-DATA_DIR = APP_DIR / "data"
+# ---------- Input / Output dataclasses ----------
+@dataclass
+class Inputs:
+    state: str
+    city: str
+    hdd: float
+    cdd: float
+    building_type: str                     # Office | School | Hotel | Hospital | Multi-family
+    school_subtype: Optional[str] = None   # Primary | Secondary (School only)
+    area_sf: float = 0.0
+    floors: Optional[int] = None
+    annual_hours: Optional[float] = None   # Office only
+    occupancy_rate_pct: Optional[float] = None  # Hotel only (not used; bucket fixed at 100)
+    existing_window: str = "Single pane"   # Single pane | Double pane
+    hvac_label: str = "Other"
+    heating_fuel_label: str = "Natural Gas"  # Natural Gas | Electric | None
+    cooling_installed: bool = True
+    mf_infiltration_include: Optional[bool] = True
+    elec_rate_per_kwh: float = 0.12
+    gas_rate_per_therm: float = 1.00
+    csw_installed_area_sf: Optional[float] = None
+    csw_panes: str = "Double"              # Single | Double
 
-# Bump this any time you change loaders to bust Streamlit's cache easily
-CACHE_BUSTER = "2025-09-17d"
+@dataclass
+class EngineResult:
+    per_sf: Dict[str, float]
+    totals: Dict[str, float]
+    eui: Dict[str, Optional[float]]
+    debug: Dict[str, Any]
 
-st.set_page_config(page_title="CSW Savings Calculator", page_icon="🪟", layout="centered")
+# ---------- CSV loading / normalization ----------
+CANONICAL_COLUMNS = {
+    "LookKey": {"lookkey", "look_key", "key", "lookupkey"},
+    "ElecHeat_kWh_SF": {"elecheat_kwh_sf", "elecheatkwhsf", "elecheat"},
+    "Cool_kWh_SF": {"cool_kwh_sf", "coolkwhsf", "cool"},
+    "GasHeat_therm_SF": {"gasheat_therm_sf", "gasheatthermsf", "gasheat"},
+    "Cool_adjust": {"cool_adjust", "cooladjust", "cooling_adjust", "cooladj"},
+    "Infil_Heat_Factor": {"infil_heat_factor", "infilheatfactor"},
+    "Infil_Cool_Factor": {"infil_cool_factor", "infilcoolfactor"},
+    "Base_EUI": {"base_eui", "baseeui"},
+    "CSW_EUI": {"csw_eui", "csweui"},
+}
+NUMERIC_COLS = [
+    "ElecHeat_kWh_SF","Cool_kWh_SF","GasHeat_therm_SF",
+    "Cool_adjust","Infil_Heat_Factor","Infil_Cool_Factor",
+    "Base_EUI","CSW_EUI",
+]
 
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.strip().lower())
 
-# ================== Data Loading ==================
-@st.cache_data
-def load_weather(_v: str = "1") -> pd.DataFrame:
-    """
-    Robust loader for weather_information.csv
-    - Fuzzy-matches HDD/CDD headers (e.g., HDD65, Heating Degree Days, etc.)
-    - Trims whitespace, cleans numeric cells, drops empty rows
-    """
-    path = DATA_DIR / "weather_information.csv"
-    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig", low_memory=False)
+def _normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str,str], List[str]]:
+    orig = list(df.columns)
+    norm_map: Dict[str, List[str]] = {}
+    for c in orig:
+        norm_map.setdefault(_norm(c), []).append(c)
+    rename: Dict[str,str] = {}
+    present = set()
+    for canonical, aliases in CANONICAL_COLUMNS.items():
+        for alias in (set(aliases) | {_norm(canonical)}):
+            if alias in norm_map:
+                rename[norm_map[alias][0]] = canonical
+                present.add(canonical)
+                break
+    df = df.rename(columns=rename)
+    missing = [c for c in CANONICAL_COLUMNS if c not in df.columns]
+    return df, rename, missing
 
-    # Drop totally empty columns and strip whitespace
-    df = df.dropna(axis=1, how="all")
-    for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = df[c].astype(str).str.strip()
+@lru_cache(maxsize=1)
+def load_lookup() -> Dict[str, Any]:
+    if not LOOKUP_CSV.exists():
+        raise FileNotFoundError(f"Missing {LOOKUP_CSV}.")
+    df = pd.read_csv(LOOKUP_CSV, dtype=str, encoding="utf-8-sig").fillna("")
+    df, renamed, missing = _normalize_columns(df)
+    if "LookKey" in df.columns:
+        df["LookKey"] = df["LookKey"].astype(str).str.strip()
 
-    # Normalized name -> original
-    norm = {c: re.sub(r"[^a-z0-9]+", "", c.lower()) for c in df.columns}
+    for col in NUMERIC_COLS:
+        if col not in df.columns:
+            df[col] = ""
+        nums = pd.to_numeric(df[col].replace("", pd.NA), errors="coerce")
+        if col in {"Cool_adjust","Infil_Heat_Factor","Infil_Cool_Factor"}:
+            nums = nums.fillna(1.0)
+        df[col+"__num"] = nums
 
-    def pick(regexes, exclude=None):
-        exclude = exclude or []
-        candidates = []
-        for c in df.columns:
-            n = norm[c]
-            if any(re.search(rx, n) for rx in regexes) and not any(re.search(ex, n) for ex in exclude):
-                candidates.append(c)
-        if not candidates:
-            return None
+    audit = {
+        "path": str(LOOKUP_CSV),
+        "rows": int(df.shape[0]),
+        "columns_present": list(df.columns),
+        "normalized_from": renamed,
+        "missing_canonical_columns": missing,
+        "sample_keys": df["LookKey"].head(20).tolist() if "LookKey" in df.columns else [],
+    }
+    return {"df": df, "audit": audit}
 
-        # Rank candidates: presence of '65', 'degree/deg', 'base', and non-null count
-        def score(col):
-            n = norm[col]
-            s = 0
-            if "65" in n:
-                s += 2
-            if "degree" in n or "deg" in n:
-                s += 1
-            if "base" in n:
-                s += 1
-            s += int(df[col].notna().sum() > 0)
-            return s
+# ---------- helpers for key building ----------
+def _base(existing_window: str) -> str:
+    return "Single" if "single" in existing_window.lower() else "Double"
 
-        candidates.sort(key=lambda c: (score(c), df[c].notna().sum()), reverse=True)
-        return candidates[0]
+def _csw(panes: str) -> str:
+    return "Single" if panes.strip().lower().startswith("single") else "Double"
 
-    state_col = pick([r"^state", r"^province", r"^region"]) or df.columns[0]
-    city_col = pick([r"^city", r"^cities", r"^municipality", r"^location"]) or df.columns[1]
-    hdd_col = pick([r"hdd", r"heatingdegree"], exclude=[r"cdd"])
-    cdd_col = pick([r"cdd", r"coolingdegree"])
+def _fuel(label: str) -> str:
+    s = label.strip().lower()
+    if "gas" in s: return "Gas"
+    if "elec" in s: return "Elec"
+    return "None"
 
-    # Clean numeric cells (strip commas/units)
-    def to_num(x):
-        s = (x or "").replace(",", "")
-        s = re.sub(r"[^0-9.\-]", "", s)
-        return pd.to_numeric(s, errors="coerce")
+def _hvac_code(bt: str, hvac_label: str, mf_size: Optional[str]=None) -> str:
+    s = hvac_label.strip().lower(); bt = bt.strip().lower()
+    if bt == "office":
+        if "built-up vav" in s: return "VAV"
+        if "electric reheat" in s: return "PVAV_Elec"
+        if "hydronic reheat" in s: return "PVAV_Gas"
+        return "Other"
+    if bt == "school":
+        if "vav" in s: return "VAV"
+        if "fan coil" in s: return "FCU"
+        return "Other"
+    if bt == "hotel":
+        if "pthp" in s: return "PTHP"
+        if "ptac" in s: return "PTAC"
+        if "fan coil" in s: return "FCU"
+        return "Other"
+    if bt == "hospital":
+        if "vav" in s: return "VAV"
+        return "Other"
+    if bt == "multi-family":
+        return "PTAC" if (mf_size == "Low") else "FCU"
+    return "Other"
 
-    HDD = df[hdd_col].map(to_num) if hdd_col else pd.Series([pd.NA] * len(df))
-    CDD = df[cdd_col].map(to_num) if cdd_col else pd.Series([pd.NA] * len(df))
+def _derive_office_size(area_sf: float, hvac_code: str) -> str:
+    return "Large" if (area_sf > 30000 and hvac_code == "VAV") else "Mid"
 
-    out = pd.DataFrame(
-        {
-            "State": df[state_col],
-            "City": df[city_col],
-            "HDD": HDD,
-            "CDD": CDD,
-        }
+def _derive_hotel_size(hvac_code: str) -> str:
+    return "Small" if hvac_code in {"PTAC","PTHP"} else "Large"
+
+def _derive_mf_size(floors: Optional[int]) -> str:
+    if floors is None: return "Low"
+    return "Low" if floors < 4 else "Mid"
+
+def _closest_buckets(hours: float) -> Tuple[int,int,float]:
+    if hours <= HOURS_BUCKETS[0]: return HOURS_BUCKETS[0], HOURS_BUCKETS[0], 0.0
+    if hours >= HOURS_BUCKETS[-1]: return HOURS_BUCKETS[-1], HOURS_BUCKETS[-1], 0.0
+    for i in range(len(HOURS_BUCKETS)-1):
+        lo, hi = HOURS_BUCKETS[i], HOURS_BUCKETS[i+1]
+        if lo <= hours <= hi:
+            t = (hours - lo) / (hi - lo) if hi>lo else 0.0
+            return lo, hi, t
+    return HOURS_BUCKETS[1], HOURS_BUCKETS[1], 0.0
+
+# ---------- lookup helpers ----------
+def _row(df: pd.DataFrame, key: str) -> Optional[pd.Series]:
+    if "LookKey" not in df.columns: return None
+    hit = df.loc[df["LookKey"] == key]
+    return None if hit.empty else hit.iloc[0]
+
+def _prefix(df: pd.DataFrame, p: str, n:int=30) -> List[str]:
+    if "LookKey" not in df.columns: return []
+    return df[df["LookKey"].str.startswith(p, na=False)]["LookKey"].head(n).tolist()
+
+def _similar(df: pd.DataFrame, target: str, n:int=10) -> List[str]:
+    if "LookKey" not in df.columns: return []
+    keys = df["LookKey"].astype(str).tolist()
+    return difflib.get_close_matches(target, keys, n=n, cutoff=0.5)
+
+def _safe_num(x: Any, default: float=0.0) -> float:
+    try: return float(x)
+    except Exception: return default
+
+def _avg(a: Any, b: Any) -> float:
+    A, B = _safe_num(a, math.nan), _safe_num(b, math.nan)
+    if math.isnan(A) and math.isnan(B): return math.nan
+    if math.isnan(A): return B
+    if math.isnan(B): return A
+    return 0.5*(A+B)
+
+def _btag(bt: str, school_sub: Optional[str], mf_size: Optional[str]) -> str:
+    x = bt.lower()
+    if x=="office": return "Office"
+    if x=="school": return "PS" if (school_sub or "").lower().startswith("pri") else "SS"
+    if x=="hotel":  return "Hotel"
+    if x=="hospital": return "Hosp"
+    if x=="multi-family": return f"{'Low' if (mf_size or 'Low')=='Low' else 'Mid'}MF"
+    return ""
+
+def _inventory(df: pd.DataFrame, base: str, csw: str, tag: str) -> List[str]:
+    return _prefix(df, f"{base}{csw}{tag}", 100)
+
+def _rowdbg(r: pd.Series) -> Dict[str, Any]:
+    return {
+        "LookKey": r.get("LookKey",""),
+        "ElecHeat_kWh_SF": _safe_num(r.get("ElecHeat_kWh_SF__num",0)),
+        "Cool_kWh_SF": _safe_num(r.get("Cool_kWh_SF__num",0)),
+        "GasHeat_therm_SF": _safe_num(r.get("GasHeat_therm_SF__num",0)),
+        "Cool_adjust": _safe_num(r.get("Cool_adjust__num",1.0)),
+        "Infil_Heat_Factor": _safe_num(r.get("Infil_Heat_Factor__num",1.0)),
+        "Infil_Cool_Factor": _safe_num(r.get("Infil_Cool_Factor__num",1.0)),
+        "Base_EUI": _safe_num(r.get("Base_EUI__num", math.nan), math.nan),
+        "CSW_EUI": _safe_num(r.get("CSW_EUI__num", math.nan), math.nan),
+    }
+
+def _debug_payload(
+    df: pd.DataFrame,
+    audit: Dict[str, Any],
+    attempted: List[str],
+    bt: str,
+    school_sub: Optional[str],
+    mf_size: Optional[str],
+    base: str,
+    csw: str,
+    prefix_hint: str,
+) -> Dict[str, Any]:
+    """Builds the debug dict when a LookKey miss occurs (and for UI panel)."""
+    btag = _btag(bt, school_sub, mf_size)
+    last_key = attempted[-1] if attempted else ""
+    # For suggestions, drop trailing digits (e.g., Office hour buckets)
+    prefix_for_suggest = re.sub(r"\d+$", "", prefix_hint)
+    return {
+        "attempted_keys": attempted,
+        "matched_keys": {},  # none; this is a miss path
+        "expected_building_prefix": f"{base}{csw}{btag}",
+        "inventory_keys_for_building_prefix": _inventory(df, base, csw, btag)[:50],
+        "prefix_used_for_suggestions": prefix_for_suggest,
+        "prefix_candidates": _prefix(df, prefix_for_suggest, 50),
+        "similar_keys": _similar(df, last_key, 20),
+        "csv_audit": audit,
+    }
+
+# ---------- main compute ----------
+def compute_savings(inp: Inputs) -> EngineResult:
+    loaded = load_lookup()
+    df, audit = loaded["df"], loaded["audit"]
+
+    base = _base(inp.existing_window)
+    csw  = _csw(inp.csw_panes)
+    fuel = _fuel(inp.heating_fuel_label)
+
+    if inp.building_type == "Multi-family":
+        mf_size = _derive_mf_size(inp.floors)
+        hvac = _hvac_code("Multi-family", inp.hvac_label, mf_size)
+        hvac = "PTAC" if mf_size == "Low" else "FCU"  # enforce
+        if hvac == "PTAC" or fuel == "None":
+            fuel = "Elec"
+    else:
+        mf_size = None
+        hvac = _hvac_code(inp.building_type, inp.hvac_label)
+
+    attempted: List[str] = []
+    matched: Dict[str, Dict[str, Any]] = {}
+
+    bt = inp.building_type
+    if bt == "Office":
+        size = _derive_office_size(inp.area_sf or 0, hvac)
+        hours = inp.annual_hours or HOURS_BUCKETS[1]
+        lo_b, hi_b, t = _closest_buckets(hours)
+        def key(b:int) -> str: return f"{base}{csw}{size}Office{hvac}{fuel}{b}"
+        k_lo, k_hi = key(lo_b), key(hi_b)
+        attempted += [k_lo, k_hi]
+        r_lo, r_hi = _row(df, k_lo), _row(df, k_hi)
+        if r_lo is None and r_hi is not None: r_lo, lo_b, t = r_hi, hi_b, 0.0
+        if r_hi is None and r_lo is not None: r_hi, hi_b, t = r_lo, lo_b, 0.0
+        if r_lo is None or r_hi is None:
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, inp.school_subtype, mf_size, base, csw, f"{base}{csw}{size}Office{hvac}{fuel}")
+            )
+        matched[k_lo] = _rowdbg(r_lo); matched[k_hi] = _rowdbg(r_hi)
+        e = (1-t)*_safe_num(r_lo["ElecHeat_kWh_SF__num"]) + t*_safe_num(r_hi["ElecHeat_kWh_SF__num"])
+        c = (1-t)*_safe_num(r_lo["Cool_kWh_SF__num"])     + t*_safe_num(r_hi["Cool_kWh_SF__num"])
+        g = (1-t)*_safe_num(r_lo["GasHeat_therm_SF__num"])+ t*_safe_num(r_hi["GasHeat_therm_SF__num"])
+        if not inp.cooling_installed:
+            adj = (_safe_num(r_lo["Cool_adjust__num"],1.0)+_safe_num(r_hi["Cool_adjust__num"],1.0))/2.0
+            c *= adj
+        per_sf = {"ElecHeat_kWh_SF": round(e,6), "Cool_kWh_SF": round(c,6), "GasHeat_therm_SF": round(g,6)}
+        base_eui = _avg(r_lo["Base_EUI__num"], r_hi["Base_EUI__num"])
+        csw_eui  = _avg(r_lo["CSW_EUI__num"],  r_hi["CSW_EUI__num"])
+
+    elif bt == "School":
+        sub = (inp.school_subtype or "Primary").lower()
+        subcode = "PS" if sub.startswith("pri") else "SS"
+        key = f"{base}{csw}{subcode}{hvac}{fuel}"
+        attempted.append(key)
+        r = _row(df, key)
+        if r is None:
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, inp.school_subtype, None, base, csw, f"{base}{csw}{subcode}{hvac}{fuel}")
+            )
+        matched[key] = _rowdbg(r)
+        e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
+        if not inp.cooling_installed: c *= _safe_num(r["Cool_adjust__num"],1.0)
+        per_sf = {"ElecHeat_kWh_SF": round(e,6), "Cool_kWh_SF": round(c,6), "GasHeat_therm_SF": round(g,6)}
+        base_eui = _safe_num(r["Base_EUI__num"], math.nan); csw_eui = _safe_num(r["CSW_EUI__num"], math.nan)
+
+    elif bt == "Hotel":
+        size = _derive_hotel_size(hvac)
+        band = "High" if (hvac == "PTHP" and (inp.hdd or 0) > PTHP_HDD_SPLIT) else ("Low" if hvac=="PTHP" else "")
+        key = f"{base}{csw}{size}Hotel{hvac}{fuel}{band}{HOTEL_OCCUPANCY_BUCKET}"
+        attempted.append(key)
+        r = _row(df, key)
+        if r is None:
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, None, None, base, csw, f"{base}{csw}{size}Hotel{hvac}{fuel}")
+            )
+        matched[key] = _rowdbg(r)
+        e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
+        if not inp.cooling_installed: c *= _safe_num(r["Cool_adjust__num"],1.0)
+        per_sf = {"ElecHeat_kWh_SF": round(e,6), "Cool_kWh_SF": round(c,6), "GasHeat_therm_SF": round(g,6)}
+        base_eui = _safe_num(r["Base_EUI__num"], math.nan); csw_eui = _safe_num(r["CSW_EUI__num"], math.nan)
+
+    elif bt == "Hospital":
+        key = f"{base}{csw}Hosp{hvac}{fuel}"
+        attempted.append(key)
+        r = _row(df, key)
+        if r is None:
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, None, None, base, csw, f"{base}{csw}Hosp{hvac}{fuel}")
+            )
+        matched[key] = _rowdbg(r)
+        e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
+        if not inp.cooling_installed: c *= _safe_num(r["Cool_adjust__num"],1.0)
+        per_sf = {"ElecHeat_kWh_SF": round(e,6), "Cool_kWh_SF": round(c,6), "GasHeat_therm_SF": round(g,6)}
+        base_eui = _safe_num(r["Base_EUI__num"], math.nan); csw_eui = _safe_num(r["CSW_EUI__num"], math.nan)
+
+    elif bt == "Multi-family":
+        size = _derive_mf_size(inp.floors)
+        hvac = "PTAC" if size == "Low" else "FCU"
+        if hvac == "PTAC" or fuel == "None": fuel = "Elec"
+        key = f"{base}{csw}{size}MF{hvac}{fuel}"
+        attempted.append(key)
+        r = _row(df, key)
+        if r is None:
+            raise ValueError(
+                "no LookKey match.",
+                _debug_payload(df, audit, attempted, bt, None, size, base, csw, f"{base}{csw}{size}MF{hvac}{fuel}")
+            )
+        matched[key] = _rowdbg(r)
+        e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
+        if inp.mf_infiltration_include is False:
+            e *= _safe_num(r["Infil_Heat_Factor__num"],1.0)
+            c *= _safe_num(r["Infil_Cool_Factor__num"],1.0)
+        if not inp.cooling_installed: c *= _safe_num(r["Cool_adjust__num"],1.0)
+        per_sf = {"ElecHeat_kWh_SF": round(e,6), "Cool_kWh_SF": round(c,6), "GasHeat_therm_SF": round(g,6)}
+        base_eui = _safe_num(r["Base_EUI__num"], math.nan); csw_eui = _safe_num(r["CSW_EUI__num"], math.nan)
+
+    else:
+        raise ValueError(f"Unsupported building type: {bt}")
+
+    area = inp.csw_installed_area_sf if (inp.csw_installed_area_sf and inp.csw_installed_area_sf>0) else inp.area_sf
+    area = max(area or 0.0, 0.0)
+
+    elec_heat_kwh = per_sf["ElecHeat_kWh_SF"] * area
+    cool_kwh      = per_sf["Cool_kWh_SF"] * area
+    gas_therms    = per_sf["GasHeat_therm_SF"] * area
+    total_kwh     = elec_heat_kwh + cool_kwh
+    cost_savings  = total_kwh * float(inp.elec_rate_per_kwh) + gas_therms * float(inp.gas_rate_per_therm)
+
+    eui_savings = None
+    if not math.isnan(base_eui) and not math.isnan(csw_eui):
+        eui_savings = base_eui - csw_eui
+
+    # Success-path debug (also useful)
+    btag = _btag(bt, inp.school_subtype, mf_size)
+    last_key = attempted[-1] if attempted else ""
+    prefix_for_suggest = re.sub(r"\d+$","", last_key)
+    debug = {
+        "attempted_keys": attempted,
+        "matched_keys": matched,
+        "expected_building_prefix": f"{base}{csw}{btag}",
+        "inventory_keys_for_building_prefix": _inventory(df, base, csw, btag)[:50],
+        "prefix_used_for_suggestions": prefix_for_suggest,
+        "prefix_candidates": _prefix(df, prefix_for_suggest, 50),
+        "similar_keys": _similar(df, last_key, 20),
+        "csv_audit": audit,
+    }
+
+    return EngineResult(
+        per_sf=per_sf,
+        totals={
+            "elec_kwh": round(elec_heat_kwh,3),
+            "cool_kwh": round(cool_kwh,3),
+            "gas_therms": round(gas_therms,3),
+            "total_kwh": round(total_kwh,3),
+            "total_therms": round(gas_therms,3),
+            "cost_savings": round(cost_savings,2),
+            "area_used_sf": area,
+        },
+        eui={
+            "eui_base_kbtusf": None if math.isnan(base_eui) else round(base_eui,3),
+            "eui_csw_kbtusf": None if math.isnan(csw_eui) else round(csw_eui,3),
+            "eui_savings_kbtusf": None if eui_savings is None else round(eui_savings,3),
+        },
+        debug=debug,
     )
-
-    # Drop rows missing state/city
-    out = out[(out["State"].astype(str) != "") & (out["City"].astype(str) != "")]
-    return out.reset_index(drop=True)
-
-
-@st.cache_data
-def load_lists() -> Dict[str, List[str]]:
-    """Load lists.csv (Arrow-safe: coerce Value to string)."""
-    path = DATA_DIR / "lists.csv"
-    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
-    cat_col = next((c for c in df.columns if c.lower().strip() == "category"), df.columns[0])
-    val_col = next((c for c in df.columns if c.lower().strip() == "value"), df.columns[1])
-    df[val_col] = df[val_col].astype(str)  # avoid mixed type warnings in Streamlit/pyarrow
-
-    out: Dict[str, List[str]] = {}
-    for cat, grp in df.groupby(cat_col):
-        vals = [v for v in grp[val_col].tolist() if v]
-        out[cat] = vals
-    return out
-
-
-@st.cache_data
-def load_hvac_overrides() -> pd.DataFrame:
-    """
-    Load hvac_overrides.csv
-    Expect columns like: BuildingType, SubType, HVACOption (case-insensitive).
-    """
-    path = DATA_DIR / "hvac_overrides.csv"
-    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
-    m = {c.lower().strip(): c for c in df.columns}
-    bt = m.get("buildingtype", list(df.columns)[0])
-    stype = m.get("subtype", list(df.columns)[1])
-    hvac = m.get("hvacoption", list(df.columns)[2])
-    return df.rename(columns={bt: "BuildingType", stype: "SubType", hvac: "HVACOption"})
-
-
-def allowed_hvac(building_type: str, subtype: str) -> List[str]:
-    """Filter HVAC options per hvac_overrides.csv, always include 'Other'."""
-    df = load_hvac_overrides()
-    subset = df[(df["BuildingType"] == building_type) & (df["SubType"] == subtype)]
-    opts = subset["HVACOption"].unique().tolist()
-    if "Other" not in opts:
-        opts.append("Other")
-    return opts or ["Other"]
-
-
-# ================== Subtype helpers ==================
-def mf_subtype_from_floors(floors: Optional[int]) -> str:
-    return "Low-rise Multifamily" if (floors is not None and floors < 4) else "Mid-rise Multifamily"
-
-
-def office_subtype_preview(area_sf: float, hvac_label_hint: str = "Built-up VAV with hydronic reheat") -> str:
-    # The override file uses Mid-size/Large Office, but options are the same; this is for consistency.
-    return "Large Office" if (area_sf > 30000 and "built-up vav" in hvac_label_hint.lower()) else "Mid-size Office"
-
-
-def hotel_subtype_preview(hvac_label_hint: str = "PTAC") -> str:
-    s = hvac_label_hint.lower()
-    return "Small Hotel" if ("ptac" in s or "pthp" in s) else "Large Hotel"
-
-
-# ================== Wizard State ==================
-if "step" not in st.session_state:
-    st.session_state.step = 1
-
-
-def next_step():
-    st.session_state.step += 1
-
-
-def prev_step():
-    st.session_state.step = max(1, st.session_state.step - 1)
-
-
-# Load data (with cache-busting arg for weather)
-weather_df = load_weather(_v=CACHE_BUSTER)
-lists = load_lists()
-
-# ================== UI ==================
-st.title("CSW Savings Calculator")
-
-# ---------- Step 1: Location ----------
-if st.session_state.step == 1:
-    st.header("1) Location")
-
-    states = sorted(weather_df["State"].unique().tolist())
-    default_state_idx = states.index("Colorado") if "Colorado" in states else 0
-    state = st.selectbox("State", states, index=default_state_idx, key="state_select")
-
-    cities = sorted(weather_df[weather_df["State"] == state]["City"].unique().tolist())
-    city = st.selectbox("City", cities, key="city_select")
-
-    row = weather_df[(weather_df["State"] == state) & (weather_df["City"] == city)].head(1)
-    hdd_val = row["HDD"].iloc[0] if not row.empty else None
-    cdd_val = row["CDD"].iloc[0] if not row.empty else None
-    hdd = float(hdd_val) if pd.notna(hdd_val) else 6500.0
-    cdd = float(cdd_val) if pd.notna(cdd_val) else 900.0
-
-    st.write(f"HDD: **{hdd:.0f}**, CDD: **{cdd:.0f}**")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Next ➜", key="btn_step1_next"):
-            st.session_state.location = {"state": state, "city": city, "hdd": hdd, "cdd": cdd}
-            next_step()
-    with col2:
-        st.button("Reset", on_click=lambda: st.session_state.clear(), key="btn_step1_reset")
-
-# ---------- Step 2: Building Type ----------
-elif st.session_state.step == 2:
-    st.header("2) Building Type")
-    btypes = ["Office", "School", "Hotel", "Hospital", "Multi-family"]
-    # IMPORTANT: widget keys must NOT collide with our own dict key 'btype'
-    btype_choice = st.selectbox("Building Type", btypes, key="building_type_select")
-
-    school_sub = None
-    if btype_choice == "School":
-        school_sub = st.radio("School Sub-type", ["Primary", "Secondary"], horizontal=True, key="school_subtype_radio")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("◀ Back", key="btn_step2_back"):
-            prev_step()
-    with col2:
-        if st.button("Next ➜", key="btn_step2_next"):
-            # Store our own dict in a DIFFERENT key (not used by widgets)
-            st.session_state.btype = {"building_type": btype_choice, "school_subtype": school_sub}
-            next_step()
-
-# ---------- Step 3: Building Details ----------
-elif st.session_state.step == 3:
-    st.header("3) Building Details")
-
-    btype = st.session_state.btype["building_type"]
-    school_sub = st.session_state.btype.get("school_subtype")
-
-    # Common inputs (widget keys distinct from our dict keys)
-    area_sf = st.number_input("Building floor area (sf)", min_value=0.0, value=50000.0, step=1000.0, key="area_input")
-    floors = st.number_input("Number of floors", min_value=1, value=3, step=1, key="floors_input")
-    existing_win = st.selectbox("Existing window type", ["Single pane", "Double pane"], index=0, key="existing_window_select")
-    heat_fuel = st.selectbox("Primary heating fuel", ["Natural Gas", "Electric", "None"], index=0, key="fuel_select")
-    cooling_installed = (st.radio("Cooling installed?", ["Yes", "No"], horizontal=True, index=0, key="cooling_radio") == "Yes")
-
-    # Optional per-building fields
-    annual_hours = None
-    occupancy = None
-    mf_infil_include = True
-
-    # HVAC options (filtered by hvac_overrides.csv)
-    subtype_for_hvac = {
-        "Office": office_subtype_preview(area_sf),
-        "School": f"{school_sub} School" if btype == "School" else "",
-        "Hotel": hotel_subtype_preview(),
-        "Hospital": "Hospital",
-        "Multi-family": mf_subtype_from_floors(floors),
-    }[btype]
-
-    if btype == "Multi-family":
-        mf_infil_include = st.checkbox("Include infiltration savings?", value=True, key="mf_infil_checkbox")
-
-    hvac_opts = allowed_hvac(btype, subtype_for_hvac)
-
-    if btype == "Office":
-        annual_hours = st.number_input("Annual operating hours", min_value=0.0, value=3000.0, step=100.0, key="hours_input")
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
-    elif btype == "School":
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
-    elif btype == "Hotel":
-        occupancy = st.slider("Average occupancy (%)", min_value=0, max_value=100, value=70, step=5, key="occ_slider")
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
-    elif btype == "Hospital":
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
-    else:  # Multi-family
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("◀ Back", key="btn_step3_back"):
-            prev_step()
-    with col2:
-        if st.button("Next ➜", key="btn_step3_next"):
-            st.session_state.details = {
-                "area_sf": area_sf,
-                "floors": int(floors),
-                "annual_hours": annual_hours,
-                "occupancy": occupancy,
-                "existing_window": existing_win,
-                "hvac": hvac,
-                "heating_fuel": heat_fuel,
-                "cooling_installed": cooling_installed,
-                "mf_infil_include": mf_infil_include,
-            }
-            next_step()
-
-# ---------- Step 4: Rates & Scope ----------
-elif st.session_state.step == 4:
-    st.header("4) Rates & Scope")
-
-    elec_rate = st.number_input("Electricity rate ($/kWh)", min_value=0.0, value=0.14, step=0.01, format="%.4f", key="erate_input")
-    gas_rate = st.number_input("Natural Gas rate ($/therm)", min_value=0.0, value=1.20, step=0.05, format="%.4f", key="grate_input")
-    csw_area = st.number_input("CSW installed area (sf) — leave 0 to use building area", min_value=0.0, value=0.0, step=100.0, key="csw_area_input")
-    csw_panes = st.radio("CSW glazing", ["Double", "Single"], index=0, horizontal=True, key="csw_panes_radio")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("◀ Back", key="btn_step4_back"):
-            prev_step()
-    with col2:
-        if st.button("Next ➜", key="btn_step4_next"):
-            st.session_state.rates = {
-                "elec_rate": float(elec_rate),
-                "gas_rate": float(gas_rate),
-                "csw_area": float(csw_area),
-                "csw_panes": csw_panes,
-            }
-            next_step()
-
-# ---------- Step 5: Review & Results ----------
-else:
-    st.header("5) Review & Results")
-
-    # Gather inputs across steps
-    loc = st.session_state.location
-    bt = st.session_state.btype
-    det = st.session_state.details
-    rt = st.session_state.rates
-
-    inp = Inputs(
-        state=loc["state"],
-        city=loc["city"],
-        hdd=loc["hdd"],
-        cdd=loc["cdd"],
-        building_type=bt["building_type"],
-        school_subtype=bt.get("school_subtype"),
-        area_sf=det["area_sf"],
-        floors=det["floors"],
-        annual_hours=det.get("annual_hours"),
-        occupancy_rate_pct=det.get("occupancy"),
-        existing_window=det["existing_window"],
-        hvac_label=det["hvac"],
-        heating_fuel_label=det["heating_fuel"],
-        cooling_installed=det["cooling_installed"],
-        mf_infiltration_include=det["mf_infil_include"],
-        elec_rate_per_kwh=rt["elec_rate"],
-        gas_rate_per_therm=rt["gas_rate"],
-        csw_installed_area_sf=rt["csw_area"],
-        csw_panes=rt["csw_panes"],
-    )
-
-    err_block = st.empty()
-    result_block = st.container()
-
-    try:
-        res = compute_savings(inp)
-
-        with result_block:
-            st.subheader("Savings Summary")
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.metric("Electric heat savings (kWh)", f"{res.totals['elec_kwh']:,}")
-                st.metric("Cooling savings (kWh)", f"{res.totals['cool_kwh']:,}")
-            with c2:
-                st.metric("Gas heat savings (therms)", f"{res.totals['gas_therms']:,}")
-                st.metric("Total kWh", f"{res.totals['total_kwh']:,}")
-            with c3:
-                st.metric("Total therms", f"{res.totals['total_therms']:,}")
-                st.metric("Estimated cost savings", f"${res.totals['cost_savings']:,}")
-
-            st.caption(f"Area used for totals: **{res.totals['area_used_sf']:.0f} sf**")
-
-            st.markdown("**Per-square-foot savings**")
-            st.table(pd.DataFrame([res.per_sf]))
-
-            st.markdown("**EUI (if available in CSV)**")
-            st.table(pd.DataFrame([res.eui]))
-
-        # Debug Panel
-        with st.expander("🔎 Debug panel (LookKey tracing)"):
-            st.markdown("**Attempted LookKey(s)**")
-            st.code("\n".join(res.debug.get("attempted_keys", [])) or "(none)")
-
-            st.markdown("**Matched rows (values parsed)**")
-            matched = res.debug.get("matched_keys", {})
-            st.json(matched if matched else {"matched": "(none)"})
-
-            st.markdown("**CSV audit**")
-            st.json(res.debug.get("csv_audit", {}))
-
-            st.markdown("**Expected building prefix**")
-            st.code(res.debug.get("expected_building_prefix", ""))
-
-            st.markdown("**Inventory for this building prefix (top 50)**")
-            inv = res.debug.get("inventory_keys_for_building_prefix", [])
-            st.code("\n".join(inv) or "(none)")
-
-            st.markdown("**Prefix used for suggestions**")
-            st.code(res.debug.get("prefix_used_for_suggestions", ""))
-
-            st.markdown("**Keys starting with that prefix (top 50)**")
-            prefs = res.debug.get("prefix_candidates", [])
-            st.code("\n".join(prefs) or "(none)")
-
-            st.markdown("**Similar keys (fuzzy matches)**")
-            st.code("\n".join(res.debug.get("similar_keys", [])) or "(none)")
-
-    except Exception as e:
-        with err_block.container():
-            msg = getattr(e, "args", ["Error"])[0]
-            st.error(f"Could not compute savings for the selected combination: {msg}")
-
-            # If the engine attached a rich debug payload as args[1], surface it
-            if len(getattr(e, "args", [])) > 1 and isinstance(e.args[1], dict):
-                dbg = e.args[1]
-                with st.expander("🔎 Debug panel (LookKey tracing)"):
-                    st.markdown("**Attempted LookKey(s)**")
-                    st.code("\n".join(dbg.get("attempted_keys", [])) or "(none)")
-
-                    st.markdown("**CSV audit**")
-                    st.json(dbg.get("csv_audit", {}))
-
-                    st.markdown("**Expected building prefix**")
-                    st.code(dbg.get("expected_building_prefix", ""))
-
-                    st.markdown("**Inventory for this building prefix (top 50)**")
-                    st.code("\n".join(dbg.get("inventory_keys_for_building_prefix", [])) or "(none)")
-
-                    st.markdown("**Prefix used for suggestions**")
-                    st.code(dbg.get("prefix_used_for_suggestions", ""))
-
-                    st.markdown("**Keys starting with that prefix (top 50)**")
-                    st.code("\n".join(dbg.get("prefix_candidates", [])) or "(none)")
-
-                    st.markdown("**Similar keys (fuzzy matches)**")
-                    st.code("\n".join(dbg.get("similar_keys", [])) or "(none)")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.button("◀ Back", on_click=prev_step, key="btn_step5_back")
-    with col2:
-        st.button("Start Over", on_click=lambda: st.session_state.clear(), key="btn_step5_reset")
