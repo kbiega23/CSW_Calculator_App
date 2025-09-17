@@ -179,6 +179,31 @@ def hvac_options_from_overrides(overrides_df: pd.DataFrame, building_type: str, 
         fallback.append("Other")
     return fallback
 
+def compute_wwr(area_ft2: float, floors: int, csw_area_ft2: float, wall_height_ft: float = 15.0) -> float:
+    """
+    Excel WWR formula (per your workbook):
+      WWR = CSW Area / [ (sqrt(Building Area / Floors) * 4) * Wall Height * Floors ]
+
+      i.e., =F27 / ((F18/F19)^0.5 * 4 * 15 * F19)
+    """
+    try:
+        area = float(area_ft2)
+        flrs = int(floors)
+        csw = float(csw_area_ft2)
+        h = float(wall_height_ft)
+    except Exception:
+        return 0.0
+
+    if area <= 0 or flrs <= 0 or h <= 0:
+        return 0.0
+
+    side = (area / flrs) ** 0.5          # sqrt(A/F)
+    perimeter = side * 4                  # 4 * sqrt(A/F)
+    wall_area = perimeter * h * flrs      # perimeter * height * floors
+    if wall_area <= 0:
+        return 0.0
+    return csw / wall_area
+
 # ============== Wizard State ==============
 TOTAL_STEPS = 6
 if "step" not in st.session_state:
@@ -250,15 +275,7 @@ elif st.session_state.step == 2:
     st.number_input("Building Area (ft²)", min_value=0.0, value=100000.0, step=1000.0, format="%.0f", key="area_ft2")
     st.number_input("Number of Floors", min_value=1, value=3, step=1, key="floors")
 
-    # Preliminary sub-building (may finalize in Step 3 after HVAC/school subtype)
-    prelim = compute_sub_building(
-        st.session_state.get("building_type", "Office"),
-        st.session_state.get("area_ft2", 0.0),
-        st.session_state.get("floors", 1),
-        st.session_state.get("hvac_type", ""),     # may be empty before Step 3
-        st.session_state.get("school_subtype", None),
-    )
-    st.info(f"**Preliminary Sub-Building Type:** {prelim} (finalized after HVAC selection, if applicable)")
+    # (1) Removed preliminary sub-building output here per your request.
 
     progress_bar()
     col1, col2 = st.columns(2)
@@ -273,12 +290,14 @@ elif st.session_state.step == 3:
     area_ft2 = st.session_state.get("area_ft2", 0.0)
     floors = st.session_state.get("floors", 1)
 
-    # School subtype (Excel F17) — user selects here
-    school_subtype = None
+    # (2) School subtype (Excel F17) — show ONLY if School is selected
     if building_type == "School":
-        school_subtype = st.selectbox("School Type", ["Primary School", "Secondary School"], index=1, key="school_subtype")
+        st.selectbox("School Type", ["Primary School", "Secondary School"], index=1, key="school_subtype")
+    else:
+        # Clear any prior value when not School
+        st.session_state.pop("school_subtype", None)
 
-    # Compute sub-building with the (possibly prior) hvac selection
+    # Compute sub-building with current HVAC (if any) and school subtype (if any)
     current_hvac = st.session_state.get("hvac_type", "")
     sub_building = compute_sub_building(building_type, area_ft2, floors, current_hvac, st.session_state.get("school_subtype"))
     st.session_state["sub_building_type"] = sub_building
@@ -293,7 +312,7 @@ elif st.session_state.step == 3:
     st.selectbox("HVAC System Type", hvac_choices, key="hvac_type", index=default_index,
                  help=f"Options for **{building_type} → {sub_building}**")
 
-    # Recompute sub-building now that HVAC might have changed
+    # Recompute sub-building now that HVAC might have changed (for Office/Hotel rules)
     sub_building = compute_sub_building(building_type, area_ft2, floors, st.session_state.get("hvac_type",""), st.session_state.get("school_subtype"))
     st.session_state["sub_building_type"] = sub_building
     st.caption(f"Finalized as: **{sub_building}**")
@@ -305,12 +324,13 @@ elif st.session_state.step == 3:
         st.number_input("Average Occupancy Rate (%)", min_value=0.0, max_value=100.0, value=70.0, step=1.0, key="hotel_occupancy_pct")
     elif building_type == "Multi-family":
         st.checkbox("Include infiltration savings", value=True, key="mf_include_infiltration")
-    # Hospital: no special input here beyond HVAC; School handled above.
+    # Hospital: no special input here beyond HVAC.
 
-    # Common details across buildings
-    st.selectbox("Heating Fuel", ["Elec", "Gas"], key="heating_fuel")
-    st.selectbox("Cooling Installed?", ["Yes", "No"], key="cooling_installed")
-    st.selectbox("Type of Existing Window", ["Single pane", "Double pane", "New double pane (U<0.35)"], key="existing_window")
+    # (3) Heating Fuel (restricted options)
+    st.selectbox("Heating Fuel", ["Natural gas", "Electric", "None"], key="heating_fuel")
+
+    # (4) Existing window (restricted options)
+    st.selectbox("Type of Existing Window", ["Single pane", "Double pane"], key="existing_window")
 
     progress_bar()
     col1, col2 = st.columns(2)
@@ -324,16 +344,15 @@ elif st.session_state.step == 4:
     st.selectbox("Type of CSW Analyzed", ["Single", "Double"], key="csw_type")
     st.number_input("Sq. Ft. of CSW Installed", min_value=0.0, value=10000.0, step=500.0, format="%.0f", key="csw_area_ft2")
 
-    # Derived: WWR (Excel: =F27 / ((F18/F19)^0.5 * 4 * 15 * F19))
+    # (5) Derived: WWR using centralized Excel-equivalent function
     area = st.session_state.get("area_ft2", 0.0)
     floors = st.session_state.get("floors", 1)
     csw_area = st.session_state.get("csw_area_ft2", 0.0)
-    den = (((area / floors) ** 0.5) * 4 * 15 * floors) if floors > 0 and area > 0 else 0.0
-    wwr = csw_area / den if den > 0 else 0.0
+    wwr = compute_wwr(area, floors, csw_area, wall_height_ft=15.0)
     st.session_state["wwr"] = wwr
 
     warn = " ⚠️ **WWR is over 0.50** — check CSW area vs. building geometry." if wwr > 0.50 else ""
-    st.write(f"Estimated Window-to-Wall Ratio (WWR): **{wwr:.3f}**{warn}")
+    st.write(f"Estimated Window-to-Wall Ratio (WWR): **{wwr:.3f}** ({wwr*100:.1f}%)" + warn)
 
     progress_bar()
     col1, col2 = st.columns(2)
@@ -356,7 +375,15 @@ elif st.session_state.step == 5:
 elif st.session_state.step == 6:
     st.header("Step 6 — Review & Results")
 
-    # Summary table (compact view of key inputs)
+    # Always recompute WWR here to ensure the summary is current
+    wwr = compute_wwr(
+        st.session_state.get("area_ft2", 0.0),
+        st.session_state.get("floors", 1),
+        st.session_state.get("csw_area_ft2", 0.0),
+        wall_height_ft=15.0,
+    )
+    st.session_state["wwr"] = wwr
+
     summary = {
         "State": st.session_state.get("state"),
         "City": st.session_state.get("city"),
@@ -372,11 +399,11 @@ elif st.session_state.step == 6:
         "Existing Window": st.session_state.get("existing_window"),
         "CSW Type": st.session_state.get("csw_type"),
         "CSW Area (ft²)": st.session_state.get("csw_area_ft2"),
-        "WWR (calc)": round(st.session_state.get("wwr", 0.0), 3),
+        "WWR (calc)": round(wwr, 3),
+        "WWR (%)": f"{wwr*100:.1f}%",
         "Elec Rate ($/kWh)": st.session_state.get("elec_rate"),
         "Gas Rate ($/therm)": st.session_state.get("gas_rate"),
     }
-    # Building-specific extras
     if st.session_state.get("building_type") == "Office":
         summary["Annual Hours"] = st.session_state.get("annual_hours")
     if st.session_state.get("building_type") == "Hotel":
