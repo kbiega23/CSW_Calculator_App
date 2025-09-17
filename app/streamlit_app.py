@@ -24,7 +24,7 @@ APP_DIR = REPO_ROOT
 DATA_DIR = APP_DIR / "data"
 
 # Bump this any time you change loaders to bust Streamlit's cache easily
-CACHE_BUSTER = "2025-09-17c"
+CACHE_BUSTER = "2025-09-17d"
 
 st.set_page_config(page_title="CSW Savings Calculator", page_icon="🪟", layout="centered")
 
@@ -185,10 +185,10 @@ if st.session_state.step == 1:
 
     states = sorted(weather_df["State"].unique().tolist())
     default_state_idx = states.index("Colorado") if "Colorado" in states else 0
-    state = st.selectbox("State", states, index=default_state_idx, key="state")
+    state = st.selectbox("State", states, index=default_state_idx, key="state_select")
 
     cities = sorted(weather_df[weather_df["State"] == state]["City"].unique().tolist())
-    city = st.selectbox("City", cities, key="city")
+    city = st.selectbox("City", cities, key="city_select")
 
     row = weather_df[(weather_df["State"] == state) & (weather_df["City"] == city)].head(1)
     hdd_val = row["HDD"].iloc[0] if not row.empty else None
@@ -200,29 +200,31 @@ if st.session_state.step == 1:
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Next ➜"):
+        if st.button("Next ➜", key="btn_step1_next"):
             st.session_state.location = {"state": state, "city": city, "hdd": hdd, "cdd": cdd}
             next_step()
     with col2:
-        st.button("Reset", on_click=lambda: st.session_state.clear())
+        st.button("Reset", on_click=lambda: st.session_state.clear(), key="btn_step1_reset")
 
 # ---------- Step 2: Building Type ----------
 elif st.session_state.step == 2:
     st.header("2) Building Type")
     btypes = ["Office", "School", "Hotel", "Hospital", "Multi-family"]
-    btype = st.selectbox("Building Type", btypes, key="btype")
+    # IMPORTANT: widget keys must NOT collide with our own dict key 'btype'
+    btype_choice = st.selectbox("Building Type", btypes, key="building_type_select")
 
     school_sub = None
-    if btype == "School":
-        school_sub = st.radio("School Sub-type", ["Primary", "Secondary"], horizontal=True, key="school_sub")
+    if btype_choice == "School":
+        school_sub = st.radio("School Sub-type", ["Primary", "Secondary"], horizontal=True, key="school_subtype_radio")
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("◀ Back"):
+        if st.button("◀ Back", key="btn_step2_back"):
             prev_step()
     with col2:
-        if st.button("Next ➜"):
-            st.session_state.btype = {"building_type": btype, "school_subtype": school_sub}
+        if st.button("Next ➜", key="btn_step2_next"):
+            # Store our own dict in a DIFFERENT key (not used by widgets)
+            st.session_state.btype = {"building_type": btype_choice, "school_subtype": school_sub}
             next_step()
 
 # ---------- Step 3: Building Details ----------
@@ -232,14 +234,12 @@ elif st.session_state.step == 3:
     btype = st.session_state.btype["building_type"]
     school_sub = st.session_state.btype.get("school_subtype")
 
-    # Common inputs
-    area_sf = st.number_input("Building floor area (sf)", min_value=0.0, value=50000.0, step=1000.0, key="area")
-    floors = st.number_input("Number of floors", min_value=1, value=3, step=1, key="floors")
-    existing_win = st.selectbox("Existing window type", ["Single pane", "Double pane"], index=0, key="exist_win")
-    heat_fuel = st.selectbox("Primary heating fuel", ["Natural Gas", "Electric", "None"], index=0, key="fuel")
-    cooling_installed = (
-        st.radio("Cooling installed?", ["Yes", "No"], horizontal=True, index=0, key="cooling") == "Yes"
-    )
+    # Common inputs (widget keys distinct from our dict keys)
+    area_sf = st.number_input("Building floor area (sf)", min_value=0.0, value=50000.0, step=1000.0, key="area_input")
+    floors = st.number_input("Number of floors", min_value=1, value=3, step=1, key="floors_input")
+    existing_win = st.selectbox("Existing window type", ["Single pane", "Double pane"], index=0, key="existing_window_select")
+    heat_fuel = st.selectbox("Primary heating fuel", ["Natural Gas", "Electric", "None"], index=0, key="fuel_select")
+    cooling_installed = (st.radio("Cooling installed?", ["Yes", "No"], horizontal=True, index=0, key="cooling_radio") == "Yes")
 
     # Optional per-building fields
     annual_hours = None
@@ -256,31 +256,29 @@ elif st.session_state.step == 3:
     }[btype]
 
     if btype == "Multi-family":
-        mf_infil_include = st.checkbox("Include infiltration savings?", value=True, key="mf_infil")
+        mf_infil_include = st.checkbox("Include infiltration savings?", value=True, key="mf_infil_checkbox")
 
     hvac_opts = allowed_hvac(btype, subtype_for_hvac)
 
     if btype == "Office":
-        annual_hours = st.number_input(
-            "Annual operating hours", min_value=0.0, value=3000.0, step=100.0, key="hours"
-        )
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+        annual_hours = st.number_input("Annual operating hours", min_value=0.0, value=3000.0, step=100.0, key="hours_input")
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
     elif btype == "School":
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
     elif btype == "Hotel":
-        occupancy = st.slider("Average occupancy (%)", min_value=0, max_value=100, value=70, step=5, key="occ")
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+        occupancy = st.slider("Average occupancy (%)", min_value=0, max_value=100, value=70, step=5, key="occ_slider")
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
     elif btype == "Hospital":
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
     else:  # Multi-family
-        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac")
+        hvac = st.selectbox("HVAC system", hvac_opts, key="hvac_select")
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("◀ Back"):
+        if st.button("◀ Back", key="btn_step3_back"):
             prev_step()
     with col2:
-        if st.button("Next ➜"):
+        if st.button("Next ➜", key="btn_step3_next"):
             st.session_state.details = {
                 "area_sf": area_sf,
                 "floors": int(floors),
@@ -298,23 +296,17 @@ elif st.session_state.step == 3:
 elif st.session_state.step == 4:
     st.header("4) Rates & Scope")
 
-    elec_rate = st.number_input(
-        "Electricity rate ($/kWh)", min_value=0.0, value=0.14, step=0.01, format="%.4f", key="erate"
-    )
-    gas_rate = st.number_input(
-        "Natural Gas rate ($/therm)", min_value=0.0, value=1.20, step=0.05, format="%.4f", key="grate"
-    )
-    csw_area = st.number_input(
-        "CSW installed area (sf) — leave 0 to use building area", min_value=0.0, value=0.0, step=100.0, key="csw_area"
-    )
-    csw_panes = st.radio("CSW glazing", ["Double", "Single"], index=0, horizontal=True, key="csw_panes")
+    elec_rate = st.number_input("Electricity rate ($/kWh)", min_value=0.0, value=0.14, step=0.01, format="%.4f", key="erate_input")
+    gas_rate = st.number_input("Natural Gas rate ($/therm)", min_value=0.0, value=1.20, step=0.05, format="%.4f", key="grate_input")
+    csw_area = st.number_input("CSW installed area (sf) — leave 0 to use building area", min_value=0.0, value=0.0, step=100.0, key="csw_area_input")
+    csw_panes = st.radio("CSW glazing", ["Double", "Single"], index=0, horizontal=True, key="csw_panes_radio")
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("◀ Back"):
+        if st.button("◀ Back", key="btn_step4_back"):
             prev_step()
     with col2:
-        if st.button("Next ➜"):
+        if st.button("Next ➜", key="btn_step4_next"):
             st.session_state.rates = {
                 "elec_rate": float(elec_rate),
                 "gas_rate": float(gas_rate),
@@ -444,6 +436,6 @@ else:
 
     col1, col2 = st.columns(2)
     with col1:
-        st.button("◀ Back", on_click=prev_step)
+        st.button("◀ Back", on_click=prev_step, key="btn_step5_back")
     with col2:
-        st.button("Start Over", on_click=lambda: st.session_state.clear())
+        st.button("Start Over", on_click=lambda: st.session_state.clear(), key="btn_step5_reset")
