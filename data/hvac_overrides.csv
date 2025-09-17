@@ -1,0 +1,33 @@
+Building Type,Sub-Building Type,HVAC Option
+Office,Mid-size Office,Packaged VAV with electric reheat
+Office,Mid-size Office,Packaged VAV with hydronic reheat
+Office,Mid-size Office,Built-up VAV with hydronic reheat
+Office,Mid-size Office,Other
+Office,Large Office,Packaged VAV with electric reheat
+Office,Large Office,Packaged VAV with hydronic reheat
+Office,Large Office,Built-up VAV with hydronic reheat
+Office,Large Office,Other
+
+School,Primary School,Central Ducted VAV
+School,Primary School,Fan Coil Unit
+School,Primary School,Other
+School,Secondary School,Central Ducted VAV
+School,Secondary School,Fan Coil Unit
+School,Secondary School,Other
+
+Hotel,Small Hotel,PTAC
+Hotel,Small Hotel,PTHP
+Hotel,Small Hotel,Fan Coil Unit
+Hotel,Small Hotel,Other
+Hotel,Large Hotel,PTAC
+Hotel,Large Hotel,PTHP
+Hotel,Large Hotel,Fan Coil Unit
+Hotel,Large Hotel,Other
+
+Hospital,Hospital,Central Ducted VAV
+Hospital,Hospital,Other
+
+Multi-family,Low-rise Multifamily,PTAC
+Multi-family,Low-rise Multifamily,Other
+Multi-family,Mid-rise Multifamily,Fan Coil Unit
+Multi-family,Mid-rise Multifamily,Other
