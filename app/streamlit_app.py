@@ -1,14 +1,29 @@
-# app/streamlit_app.py
-import streamlit as st
-import pandas as pd
+# app/streamlit_app.py  — robust import of engine
 from pathlib import Path
+import sys
+
+HERE = Path(__file__).resolve()
+
+# Walk up until we find a folder that contains engine/engine.py, then add it to sys.path
+for p in [HERE.parent, *HERE.parents]:
+    if (p / "engine" / "engine.py").exists():
+        if str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+        break
+else:
+    # If we get here, the file isn't where we expect it
+    raise RuntimeError("Couldn't find engine/engine.py. Make sure there is an 'engine/engine.py' in your repo (usually at repo root).")
 
 from engine.engine import load_weather, load_lists, compute_savings
 
-APP_DIR = Path(__file__).resolve().parent
+import streamlit as st
+import pandas as pd
+
+APP_DIR = HERE.parent
 DATA_DIR = APP_DIR.parent / "data"
 
 st.set_page_config(page_title="CSW Savings Calculator (Prototype)", layout="wide")
+
 
 # ---------------- Load data ----------------
 weather_df = load_weather()
