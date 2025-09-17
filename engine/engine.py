@@ -1,188 +1,180 @@
-# engine/engine.py
+# engine/engine.py  (CSV-first; Excel as fallback)
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Tuple
-import math
+import re
 import pandas as pd
 
-# --------- Paths & simple loaders ----------
+# ---------------- Paths & simple loaders ----------------
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 def _find_excel_file() -> Path:
-    """
-    Locate the Excel workbook "CSW Savings Calculator 2_0_0_Unlocked.xlsx".
-    Default location is data/, but we scan the repo just in case.
-    """
     expected = DATA_DIR / "CSW Savings Calculator 2_0_0_Unlocked.xlsx"
     if expected.exists():
         return expected
     # fallback: scan upwards for any matching name
     root = Path(__file__).resolve().parents[2]
-    candidates = list(root.rglob("CSW Savings Calculator 2_0_0_Unlocked.xlsx"))
-    if candidates:
-        return candidates[0]
-    raise FileNotFoundError(
-        "Could not find 'CSW Savings Calculator 2_0_0_Unlocked.xlsx'. "
-        "Place it in the repo under data/."
-    )
+    for p in root.rglob("CSW Savings Calculator 2_0_0_Unlocked.xlsx"):
+        return p
+    raise FileNotFoundError("Excel workbook not found and CSVs not detected either.")
 
 def load_weather() -> pd.DataFrame:
-    """
-    Load weather_information.csv (State, Cities, HDD, CDD and 'None*' extra cols).
-    We drop the 'None*' columns if present.
-    """
     p = DATA_DIR / "weather_information.csv"
     df = pd.read_csv(p)
-    # drop accidental columns like None, None_1, ...
     keep = [c for c in df.columns if not str(c).lower().startswith("none")]
     return df[keep].rename(
-        columns=lambda c: c.strip()
+        columns=lambda c: str(c).strip()
         .replace("Heating Degree Days (HDD)", "HDD")
         .replace("Cooling Degree Days (CDD)", "CDD")
         .replace("Cities", "City")
     )
 
 def load_lists() -> pd.DataFrame:
-    """Load lists.csv for any future lookups you want to do."""
     p = DATA_DIR / "lists.csv"
-    return pd.read_csv(p)
+    return pd.read_csv(p) if p.exists() else pd.DataFrame()
 
 def load_hvac_allowed() -> pd.DataFrame:
-    """
-    hvac_options.csv (three columns: Building Type, Sub-Building Type, HVAC Option)
-    used to constrain the dropdown choices.
-    """
     p = DATA_DIR / "hvac_options.csv"
-    return pd.read_csv(p)
+    return pd.read_csv(p) if p.exists() else pd.DataFrame(columns=["Building Type", "Sub-Building Type", "HVAC Option"])
 
-# --------- Regression tables normalizer ----------
+# ---------------- Regression table helpers ----------------
 
 def _read_sheet_with_header(xl: pd.ExcelFile, sheet: str) -> pd.DataFrame:
-    """Find the header row (contains 'No.') and return a cleaned DataFrame."""
+    """(Excel path) find header row (contains 'No.') and return a cleaned DataFrame."""
     raw = xl.parse(sheet, header=None)
-    # find the row containing 'No.' which marks the header
-    mask = raw.apply(lambda r: r.astype(str).str.contains("No.", na=False).any(), axis=1)
-    if not mask.any():
-        raise ValueError(f"Could not locate header in sheet {sheet}")
-    hdr_idx = mask[mask].index[0]
-    df = xl.parse(sheet, header=hdr_idx)
+    mask = raw.apply(lambda r: r.astype(str).str.contains("No\\.|Base", na=False).any(), axis=1)
+    hdr_idx = mask[mask].index[0] if mask.any() else 0
+    return xl.parse(sheet, header=hdr_idx)
+
+def _read_regression_csv(path: Path) -> pd.DataFrame:
+    """
+    CSVs may include a header row or the Excel-like header buried a few rows down.
+    We search for a row containing 'No.' or 'Base' and use that as the header row;
+    otherwise we treat the first row as header.
+    """
+    raw = pd.read_csv(path, header=None)
+    mask = raw.apply(lambda r: r.astype(str).str.contains("No\\.|Base", na=False).any(), axis=1)
+    if mask.any():
+        hdr_idx = mask[mask].index[0]
+        df = pd.read_csv(path, header=hdr_idx)
+    else:
+        df = pd.read_csv(path)  # assume first row is header
     return df
 
 def _norm_cols(cols) -> list[str]:
-    """Give sensible names to the mixed header columns."""
     out = []
-    # the workbooks sometimes repeat 'a','b','c' under two headings
-    # we'll map them to heat_a, heat_b, heat_c, cool_a, cool_b, cool_c
-    heat_seen = 0
-    cool_seen = 0
+    heat_mode = False
+    cool_mode = False
+    heat_i = 0
+    cool_i = 0
     for c in cols:
         s = str(c).strip()
-        if s in {"Heating Coefficients", "Cooling Coefficients"}:
-            out.append(s)
+        if re.search(r"(?i)heating\s*coeff", s):
+            out.append("Heating Coefficients"); heat_mode, cool_mode = True, False
+            continue
+        if re.search(r"(?i)cooling\s*coeff", s):
+            out.append("Cooling Coefficients"); heat_mode, cool_mode = False, True
             continue
         if s in {"a", "b", "c"}:
-            if "Cooling Coefficients" in out and out[-1] == "Cooling Coefficients":
-                cool_seen += 1
-                out.append(f"cool_{'abc'[cool_seen-1]}")
-            elif "Heating Coefficients" in out and out[-1] == "Heating Coefficients":
-                heat_seen += 1
-                out.append(f"heat_{'abc'[heat_seen-1]}")
+            if cool_mode:
+                cool_i += 1; out.append(f"cool_{'abc'[cool_i-1]}")
+            elif heat_mode:
+                heat_i += 1; out.append(f"heat_{'abc'[heat_i-1]}")
             else:
-                # if we can't tell, assume heat first
-                heat_seen += 1
-                out.append(f"heat_{'abc'[heat_seen-1]}")
+                # default to heat first
+                heat_i += 1; out.append(f"heat_{'abc'[heat_i-1]}")
             continue
-        # default: keep original
-        out.append(s if s != "Unnamed: 0" else "No.")
+        out.append("No." if s == "Unnamed: 0" else s)
     return out
 
 def _normalize_table(df: pd.DataFrame, building_tag: str) -> pd.DataFrame:
     """
-    Normalize into a common schema:
-
-    Common columns we try to create:
-      Base, CSW Type, Size, HVAC, Fuel, Occupancy, heat_a,b,c, cool_a,b,c, BuildingTag
-    Size is one of: Mid/Large (Office), Small/Large (Hotel), Low/Mid (MF), '' for School/Hospital.
+    Normalize mixed layouts into:
+      Base, CSW, Size, HVAC, Fuel, Occupancy, heat_a,b,c, cool_a,b,c, BuildingTag
     """
-    # remap columns
     df = df.copy()
     df.columns = _norm_cols(df.columns)
 
-    # alias possibilities
-    size_col = None
-    for cand in ["Office Size", "Hotel Size", "MF Type"]:
-        if cand in df.columns:
-            size_col = cand
-            break
+    # locate logical columns by name variants
+    def first_present(*names):
+        for n in names:
+            if n in df.columns: return n
+        return None
 
-    hvac_col = None
-    for cand in ["HVAC/Fuel Type", "HVAC Type"]:
-        if cand in df.columns:
-            hvac_col = cand
-            break
+    size_col = first_present("Office Size", "Hotel Size", "MF Type", "Size")
+    hvac_col = first_present("HVAC/Fuel Type", "HVAC Type", "HVAC")
+    fuel_col = first_present("Fuel Type", "Fuel")
+    occ_col  = first_present("Occupancy")
 
-    fuel_col = "Fuel Type" if "Fuel Type" in df.columns else None
-    occ_col = "Occupancy" if "Occupancy" in df.columns else None
+    # compose normalized frame
+    out = pd.DataFrame()
+    def col(name): return df[name] if name and name in df.columns else pd.Series([None]*len(df))
 
-    keep = {
-        "Base": "Base",
-        "CSW Type": "CSW",
-        size_col or "": "Size",
-        hvac_col or "": "HVAC",
-        fuel_col or "": "Fuel",
-        occ_col or "": "Occupancy",
-        "heat_a": "heat_a",
-        "heat_b": "heat_b",
-        "heat_c": "heat_c",
-        "cool_a": "cool_a",
-        "cool_b": "cool_b",
-        "cool_c": "cool_c",
-    }
+    # base/secondary glazing can appear as 'CSW Type' or 'CSW'
+    csw_col = first_present("CSW Type", "CSW")
+    base_col = first_present("Base")
 
-    # build normalized frame
-    norm = pd.DataFrame()
-    # fill safe get
-    def col(name): return df[name] if name in df.columns else pd.Series([None]*len(df))
+    out["BuildingTag"] = building_tag
+    out["Base"] = col(base_col).astype(str).str.strip()
+    out["CSW"]  = col(csw_col).astype(str).str.strip()
+    out["Size"] = col(size_col).astype(str).str.strip() if size_col else ""
+    out["HVAC"] = col(hvac_col).astype(str).str.strip() if hvac_col else ""
+    out["Fuel"] = col(fuel_col).astype(str).str.strip() if fuel_col else ""
+    out["Occupancy"] = pd.to_numeric(col(occ_col), errors="coerce") if occ_col else pd.Series([None]*len(df))
 
-    norm["BuildingTag"] = building_tag
-    norm["Base"] = col("Base").astype(str).str.strip()
-    norm["CSW"] = col("CSW").astype(str).str.strip() if "CSW" in df.columns else col("CSW Type").astype(str).str.strip()
-    norm["Size"] = col(size_col) if size_col else ""
-    norm["HVAC"] = col(hvac_col) if hvac_col else ""
-    norm["Fuel"] = col(fuel_col) if fuel_col else ""
-    norm["Occupancy"] = pd.to_numeric(col(occ_col), errors="coerce") if occ_col else pd.Series([None]*len(df))
-    # coefficients
     for k in ["heat_a","heat_b","heat_c","cool_a","cool_b","cool_c"]:
-        norm[k] = pd.to_numeric(col(k), errors="coerce")
+        out[k] = pd.to_numeric(col(k), errors="coerce")
 
-    # drop header row(s)
-    norm = norm[norm["Base"].str.lower().isin(["single", "double"])]
-    # clean sizes text
-    norm["Size"] = norm["Size"].astype(str).str.strip()
-    norm["HVAC"] = norm["HVAC"].astype(str).str.strip()
-    norm["Fuel"] = norm["Fuel"].astype(str).str.strip()
-    return norm.reset_index(drop=True)
+    # keep data rows
+    out = out[out["Base"].str.lower().isin(["single", "double"])].reset_index(drop=True)
+    return out
+
+def _tag_from_filename(stem: str) -> str:
+    """
+    Extract BuildingTag from filenames like:
+    'Regresson List_Office.csv', 'Regression List_SH.csv', 'Regresson_List_PS.csv', etc.
+    """
+    s = stem
+    # remove extension semantics already
+    m = re.search(r"(?i)regress\w*\s*[_\s-]*list[_\s-]*(.+)$", s)
+    if m:
+        return m.group(1).strip()
+    # fallback: if the stem itself *is* a known tag
+    return s.strip()
+
+# ---------------- Load regressions (CSV-first) ----------------
 
 def load_regressions() -> pd.DataFrame:
     """
-    Load and combine all 'Regresson List_*' sheets into one normalized table.
-    BuildingTag values used:
-      Office, SH (Small Hotel), LH (Large Hotel), PS, SS, Hosp, MF
+    Prefer CSVs in data/ that contain 'regress' + 'list' in filename (case-insensitive).
+    If none found, fall back to reading the Excel workbook.
+    Then normalize and combine to a single table.
     """
-    xpf = _find_excel_file()
-    xl = pd.ExcelFile(xpf)
-
-    sheets = [s for s in xl.sheet_names if s.startswith("Regresson List_")]
+    csvs = [p for p in DATA_DIR.glob("*.csv") if re.search(r"(?i)regress\w*.*list", p.stem)]
     pieces = []
-    for s in sheets:
-        tag = s.replace("Regresson List_", "").strip()
-        df = _read_sheet_with_header(xl, s)
-        pieces.append(_normalize_table(df, building_tag=tag))
+
+    if csvs:
+        for p in csvs:
+            tag = _tag_from_filename(p.stem)
+            df = _read_regression_csv(p)
+            pieces.append(_normalize_table(df, building_tag=tag))
+    else:
+        # Fallback: Excel
+        xpf = _find_excel_file()
+        xl = pd.ExcelFile(xpf)
+        sheets = [s for s in xl.sheet_names if s.lower().startswith("regress")]
+        for s in sheets:
+            tag = s.replace("Regresson List_", "").replace("Regression List_", "").strip()
+            df = _read_sheet_with_header(xl, s)
+            pieces.append(_normalize_table(df, building_tag=tag))
+
+    if not pieces:
+        raise FileNotFoundError("No regression CSVs found in data/ and no Excel workbook available.")
+
     big = pd.concat(pieces, ignore_index=True)
 
-    # unify hotel/mf tags to consistent size values
-    # Office keeps Size Mid/Large
-    # Hotel: Small/ Large → tag both as Hotel, decide by Size later
+    # Map tags to canonical building labels
+    big["BuildingTag"] = big["BuildingTag"].astype(str).str.strip()
     big["Building"] = big["BuildingTag"].map({
         "Office": "Office",
         "SH": "Hotel",
@@ -191,97 +183,78 @@ def load_regressions() -> pd.DataFrame:
         "SS": "School",
         "Hosp": "Hospital",
         "MF": "Multi-family",
-    }).fillna(big["BuildingTag"])
+    }).fillna(big["BuildingTag"].replace({
+        "Regression List_Office":"Office",
+        "Regression List_SH":"Hotel",
+        "Regression List_LH":"Hotel",
+        "Regression List_PS":"School",
+        "Regression List_SS":"School",
+        "Regression List_Hosp":"Hospital",
+        "Regression List_MF":"Multi-family",
+    }))
 
-    # For School, keep subtype in BuildingTag (PS/SS)
+    # Subtype helpers
     big["SchoolSubtype"] = big["BuildingTag"].map({"PS": "Primary School", "SS": "Secondary School"}).fillna("")
-    # For MF, Size should be Low/Mid
-    big["MFSubtype"] = big.apply(lambda r: r["Size"] if r["BuildingTag"] == "MF" else "", axis=1)
-    # For Hotel, Size is in 'Size' (Small/Large)
-    big["HotelSize"] = big.apply(lambda r: r["Size"] if r["Building"] == "Hotel" else "", axis=1)
+    big["MFSubtype"] = big.apply(lambda r: r["Size"] if str(r["BuildingTag"]) == "MF" else "", axis=1)
+    big["HotelSize"] = big.apply(lambda r: r["Size"] if str(r["Building"]) == "Hotel" else "", axis=1)
 
-    # normalize string categories
+    # Clean strings
     for c in ["Base","CSW","Size","HVAC","Fuel","Building","SchoolSubtype","MFSubtype","HotelSize"]:
         big[c] = big[c].astype(str).str.strip()
 
     return big
 
-# --------- Mapping from UI to regression codes ----------
+# ---------------- Mapping UI → regression codes ----------------
 
 def _ui_to_base(window_type_ui: str) -> str:
-    # "single pane" / "double pane" → "Single"/"Double"
-    return "Single" if "single" in window_type_ui.lower() else "Double"
+    return "Single" if "single" in (window_type_ui or "").lower() else "Double"
 
 def _ui_csw_type(csw_ui: str) -> str:
-    # "Single" or "Double" glazing CSW
-    return "Single" if "single" in csw_ui.lower() else "Double"
+    return "Single" if "single" in (csw_ui or "").lower() else "Double"
 
 def _ui_to_hvac_code(building: str, sub_building: str, hvac_ui: str, fuel_ui: str) -> Tuple[str, str]:
-    """
-    Return (HVAC_code, Fuel_code) as used in regression tables.
-    """
-    fuel_code = "Electric" if fuel_ui.lower().startswith("electric") else "Natural Gas"
+    fuel_code = "Electric" if (fuel_ui or "").lower().startswith("electric") else "Natural Gas"
+    b = (building or "").lower()
 
-    b = building.lower()
-    sb = sub_building.lower()
-
-    # Office
     if b == "office":
-        if "packaged vav with electric reheat" in hvac_ui.lower():
-            return "PVAV_Elec", "Electric"
-        if "packaged vav with hydronic reheat" in hvac_ui.lower():
-            return "PVAV_Gas", "Natural Gas"
-        if "built-up vav with hydronic reheat" in hvac_ui.lower():
-            # large office VAV; let fuel follow user's choice
-            return "VAV", fuel_code
-        # fallback
+        s = (hvac_ui or "").lower()
+        if "packaged vav with electric reheat" in s: return "PVAV_Elec", "Electric"
+        if "packaged vav with hydronic reheat" in s: return "PVAV_Gas", "Natural Gas"
+        if "built-up vav with hydronic reheat" in s: return "VAV", fuel_code
         return "VAV", fuel_code
 
-    # School
     if b == "school":
-        if "fan coil" in hvac_ui.lower():
-            return "FCU", fuel_code
-        if "central ducted vav" in hvac_ui.lower() or "vav" in hvac_ui.lower():
-            return "VAV", fuel_code
+        s = (hvac_ui or "").lower()
+        if "fan coil" in s: return "FCU", fuel_code
+        if "vav" in s: return "VAV", fuel_code
         return "VAV", fuel_code
 
-    # Hotel
     if b == "hotel":
-        if "ptac" in hvac_ui.lower():
-            return "PTAC", "Electric"  # PTAC heat is electric
-        if "pthp" in hvac_ui.lower():
-            return "PTHP", "Electric"  # heat pump = electric
-        if "fan coil" in hvac_ui.lower():
-            return "FCU", fuel_code
+        s = (hvac_ui or "").lower()
+        if "ptac" in s: return "PTAC", "Electric"
+        if "pthp" in s: return "PTHP", "Electric"
+        if "fan coil" in s: return "FCU", fuel_code
         return "FCU", fuel_code
 
-    # Hospital
     if b == "hospital":
         return "VAV", fuel_code
 
-    # Multi-family
     if b.startswith("multi"):
-        if "ptac" in hvac_ui.lower():
-            return "PTAC", "Electric"
-        if "fan coil" in hvac_ui.lower():
-            return "FCU", fuel_code
+        s = (hvac_ui or "").lower()
+        if "ptac" in s: return "PTAC", "Electric"
+        if "fan coil" in s: return "FCU", fuel_code
         return "PTAC", "Electric"
 
     return "VAV", fuel_code
 
 def _hours_bucket(hours: float) -> float:
-    """
-    Excel lookup uses three discrete hours: 2080, 2912, 8760.
-    Bucket to the nearest, to mirror the workbook behavior.
-    """
     buckets = [2080.0, 2912.0, 8760.0]
     return min(buckets, key=lambda b: abs(b - float(hours or 0)))
 
 def _hotel_occ_bucket(occ_pct: float) -> float:
-    """Regressions exist for 33% and 100% occupancy."""
     return 33.0 if (occ_pct or 0) <= 50 else 100.0
 
-# --------- Core compute ----------
+# ---------------- Core compute ----------------
 
 def _pick_coeff_row(reg: pd.DataFrame,
                     building: str,
@@ -292,18 +265,13 @@ def _pick_coeff_row(reg: pd.DataFrame,
                     fuel_code: str,
                     hours_bucket: Optional[float] = None,
                     occ_bucket: Optional[float] = None) -> pd.Series:
-    """
-    Filter regression table to the single row of coefficients that matches the user's selections.
-    """
-    b = building.lower()
+    b = (building or "").lower()
     sb = (sub_building or "").lower()
     df = reg.copy()
 
-    # Base & CSW
     df = df[df["Base"].str.lower() == base_glass.lower()]
     df = df[df["CSW"].str.lower() == csw_glass.lower()]
 
-    # Building dimension filters
     if b == "office":
         size = "Mid" if "mid-size" in sb else "Large"
         df = df[(df["Building"] == "Office") & (df["Size"].str.contains(size, case=False, na=False))]
@@ -311,10 +279,8 @@ def _pick_coeff_row(reg: pd.DataFrame,
         df = df[df["Fuel"].str.lower() == fuel_code.lower()]
 
     elif b == "school":
-        # PS / SS tagged in SchoolSubtype
         ss = "Primary School" if "primary" in sb else "Secondary School"
         df = df[(df["Building"] == "School") & (df["SchoolSubtype"] == ss)]
-        # HVAC/Fuel
         df = df[df["HVAC"].str.upper() == hvac_code.upper()]
         df = df[df["Fuel"].str.lower() == fuel_code.lower()]
 
@@ -329,23 +295,19 @@ def _pick_coeff_row(reg: pd.DataFrame,
         df = df[df["HVAC"].str.upper() == hvac_code.upper()]
         df = df[df["Fuel"].str.lower() == fuel_code.lower()]
         if occ_bucket is not None and "Occupancy" in df.columns:
-            df = df[(df["Occupancy"].round(0) == round(occ_bucket,0)) | (df["Occupancy"].isna())]
+            df = df[(df["Occupancy"].round(0) == round(occ_bucket, 0)) | (df["Occupancy"].isna())]
 
     elif b.startswith("multi"):
-        # Low / Mid in MFSubtype
         mf = "Low" if "low" in sb else "Mid"
         df = df[(df["Building"] == "Multi-family") & (df["MFSubtype"].str.contains(mf, case=False, na=False))]
         df = df[df["HVAC"].str.upper() == hvac_code.upper()]
         df = df[df["Fuel"].str.lower() == fuel_code.lower()]
 
     if df.empty:
-        raise ValueError("Could not find matching regression row for the selected combination.")
-
-    # Take the first best match
+        raise ValueError("No matching regression row for the selected combination.")
     return df.iloc[0]
 
 def _poly(a: float, b: float, c: float, x: float) -> float:
-    """a + b*x + c*x^2"""
     a = float(a or 0); b = float(b or 0); c = float(c or 0); x = float(x or 0)
     return a + b*x + c*(x*x)
 
@@ -365,22 +327,14 @@ def compute_savings(
     hotel_occupancy_pct: Optional[float] = None,
     include_infiltration: Optional[bool] = None,
 ) -> Dict[str, float]:
-    """
-    Returns a dict with per-SF and total savings:
-      - elec_heat_kwh_per_sf
-      - cool_kwh_per_sf
-      - gas_heat_therm_per_sf
-      - total_kwh   (electric_heat + cooling) * area
-      - total_therms (gas_heat * area)
-    """
     reg = load_regressions()
 
-    base_glass = _ui_to_base(existing_window_type_ui)               # "Single"/"Double"
-    csw_glass  = _ui_csw_type(csw_glazing_ui)                       # "Single"/"Double"
+    base_glass = _ui_to_base(existing_window_type_ui)
+    csw_glass  = _ui_csw_type(csw_glazing_ui)
     hvac_code, fuel_code = _ui_to_hvac_code(building_type, sub_building_type, hvac_ui, heating_fuel_ui)
 
-    hrs_bucket = _hours_bucket(annual_operating_hours or 0) if building_type.lower()=="office" else None
-    occ_bucket = _hotel_occ_bucket(hotel_occupancy_pct or 0) if building_type.lower()=="hotel" else None
+    hrs_bucket = _hours_bucket(annual_operating_hours or 0) if (building_type or "").lower()=="office" else None
+    occ_bucket = _hotel_occ_bucket(hotel_occupancy_pct or 0) if (building_type or "").lower()=="hotel" else None
 
     row = _pick_coeff_row(
         reg=reg,
@@ -394,42 +348,28 @@ def compute_savings(
         occ_bucket=occ_bucket,
     )
 
-    # Base polynomial (per SF) from HDD/CDD
     heat_per_sf = _poly(row["heat_a"], row["heat_b"], row["heat_c"], float(weather_hdd))
     cool_per_sf = _poly(row["cool_a"], row["cool_b"], row["cool_c"], float(weather_cdd))
 
-    # Office hours bucketing: mirror Excel's discrete behavior (approx).
-    if building_type.lower() == "office":
-        # Scale cooling roughly by hours/8760; heating is mostly load-driven,
-        # but the Excel lookup varies slightly with hours. We'll keep heat as-is
-        # and scale cooling by hours bucket factor to mimic the lookup choices.
+    if (building_type or "").lower() == "office":
         factor = (hrs_bucket or 8760.0) / 8760.0
         cool_per_sf *= factor
 
-    # Hotel occupancy: the regression line we picked already bakes in the occupancy bucket.
-    # Nothing further needed here.
-
-    # Cooling installed?
     if not cooling_installed:
         cool_per_sf = 0.0
 
-    # Split heat savings into electric vs gas depending on chosen fuel
-    if fuel_code.lower().startswith("electric"):
+    if (fuel_code or "").lower().startswith("electric"):
         elec_heat_kwh_per_sf = max(0.0, heat_per_sf)
         gas_heat_therm_per_sf = 0.0
     else:
         elec_heat_kwh_per_sf = 0.0
         gas_heat_therm_per_sf = max(0.0, heat_per_sf)
 
-    # Optional: infiltration toggle for Multi-family (Excel has reduction factors; if excluded, just zero the delta)
-    if include_infiltration is not None and not include_infiltration and building_type.lower().startswith("multi"):
-        # Simple conservative approach: remove a small portion of savings if user excludes infiltration.
-        # (If you want to mirror exact Excel factors later, we can read and apply them when available.)
+    if include_infiltration is not None and not include_infiltration and (building_type or "").lower().startswith("multi"):
         elec_heat_kwh_per_sf *= 0.9
         cool_per_sf *= 0.9
         gas_heat_therm_per_sf *= 0.9
 
-    # Totals
     area = float(building_area_sf or 0)
     total_kwh = (elec_heat_kwh_per_sf + cool_per_sf) * area
     total_therms = gas_heat_therm_per_sf * area
