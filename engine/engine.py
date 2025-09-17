@@ -26,7 +26,7 @@ class Inputs:
     area_sf: float = 0.0
     floors: Optional[int] = None
     annual_hours: Optional[float] = None   # Office only
-    occupancy_rate_pct: Optional[float] = None  # Hotel only (not used; bucket fixed at 100)
+    occupancy_rate_pct: Optional[float] = None  # Hotel only (bucket fixed at 100)
     existing_window: str = "Single pane"   # Single pane | Double pane
     hvac_label: str = "Other"
     heating_fuel_label: str = "Natural Gas"  # Natural Gas | Electric | None
@@ -44,7 +44,7 @@ class EngineResult:
     eui: Dict[str, Optional[float]]
     debug: Dict[str, Any]
 
-# ---------- CSV loading / normalization ----------
+# ---------- CSV column canon ----------
 CANONICAL_COLUMNS = {
     "LookKey": {"lookkey", "look_key", "key", "lookupkey"},
     "ElecHeat_kWh_SF": {"elecheat_kwh_sf", "elecheatkwhsf", "elecheat"},
@@ -63,88 +63,95 @@ NUMERIC_COLS = [
 ]
 
 def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", s.strip().lower())
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
 
-def _normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str,str], List[str]]:
+# ---------- helpers for CSV sniffing ----------
+def _read_csv_safely(path: Path) -> pd.DataFrame:
+    """Try a few delimiter/header strategies to cope with messy exports."""
+    # 1) Try pandas' Python engine sniff (sep=None)
+    try:
+        return pd.read_csv(path, dtype=str, encoding="utf-8-sig", sep=None, engine="python").fillna("")
+    except Exception:
+        pass
+    # 2) Comma
+    try:
+        return pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    except Exception:
+        pass
+    # 3) Tab
+    try:
+        return pd.read_csv(path, dtype=str, encoding="utf-8-sig", sep="\t").fillna("")
+    except Exception:
+        pass
+    # 4) Semicolon
+    return pd.read_csv(path, dtype=str, encoding="utf-8-sig", sep=";").fillna("")
+
+def _normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str,str]]:
+    """Rename common aliases to canonical; return rename map."""
     orig = list(df.columns)
     norm_map: Dict[str, List[str]] = {}
     for c in orig:
         norm_map.setdefault(_norm(c), []).append(c)
     rename: Dict[str,str] = {}
-    present = set()
     for canonical, aliases in CANONICAL_COLUMNS.items():
         for alias in (set(aliases) | {_norm(canonical)}):
             if alias in norm_map:
                 rename[norm_map[alias][0]] = canonical
-                present.add(canonical)
                 break
-    df = df.rename(columns=rename)
-    missing = [c for c in CANONICAL_COLUMNS if c not in df.columns]
-    return df, rename, missing
+    return df.rename(columns=rename), rename
 
-def _guess_lookkey_column(df: pd.DataFrame) -> tuple[Optional[str], float]:
+def _guess_lookkey_column(df: pd.DataFrame) -> tuple[Optional[str], float, List[str]]:
     """
-    Heuristically detect the LookKey column when the header is weird (e.g., a title).
-    Strategy:
-      - prefer object/string cols
-      - sample values and score by:
-        * startswith 'Single' or 'Double'
-        * contains building tokens (Office|Hotel|Hosp|MF|PS|SS)
-        * contains digits (hours buckets etc.)
-        * high uniqueness
-      - small bonus if header contains 'savings' and 'lookup'
-    Returns (column_name, score) or (None, 0.0)
+    Guess the LookKey column by inspecting values:
+      - starts with Single/Double
+      - contains Office/Hotel/Hosp/MF/PS/SS
+      - has digits (hours buckets etc.)
+      - good uniqueness
+    Returns (col_name, score, sample_values)
     """
     tokens_re = re.compile(r"(Office|Hotel|Hosp|MF|PS|SS|School)", re.I)
-    best = (None, 0.0)
+    best = (None, 0.0, [])
     n = min(250, len(df))
     for c in df.columns:
-        s_name = _norm(str(c))
         ser = df[c].astype(str).str.strip()
         sample = ser.head(n)
-
         if sample.isna().all():
             continue
-
         starts = sample.str.startswith(("Single", "Double")).mean()
         contains_tok = sample.str.contains(tokens_re, na=False).mean()
         has_digit = sample.str.contains(r"\d", na=False).mean()
         uniq_frac = (sample.nunique(dropna=True) / max(len(sample), 1))
-
         score = 2*starts + 2*contains_tok + 0.5*has_digit + 1.0*uniq_frac
-        if ("savings" in s_name and "lookup" in s_name):
-            score += 0.5
-
         if score > best[1]:
-            best = (c, score)
-
-    # Require a reasonable threshold
-    if best[1] >= 2.0:
+            best = (c, score, sample.head(10).tolist())
+    # Lowered threshold so we succeed on sparse sheets too
+    if best[1] >= 1.0:
         return best
-    return (None, 0.0)
+    return (None, 0.0, [])
 
 @lru_cache(maxsize=1)
 def load_lookup() -> Dict[str, Any]:
     if not LOOKUP_CSV.exists():
         raise FileNotFoundError(f"Missing {LOOKUP_CSV}.")
-    df = pd.read_csv(LOOKUP_CSV, dtype=str, encoding="utf-8-sig").fillna("")
-    df, renamed, missing = _normalize_columns(df)
+    df = _read_csv_safely(LOOKUP_CSV)
+    df, renamed = _normalize_columns(df)
 
-    lookkey_guess_from = None
-    lookkey_guess_score = None
+    lookkey_from = None
+    lookkey_score = None
+    lookkey_samples: List[str] = []
 
-    # If LookKey is still missing, try to guess it by content
+    # Heuristic LookKey if not present
     if "LookKey" not in df.columns:
-        guess_col, score = _guess_lookkey_column(df)
-        if guess_col is not None:
-            df = df.rename(columns={guess_col: "LookKey"})
-            lookkey_guess_from = guess_col
-            lookkey_guess_score = round(float(score), 3)
+        gcol, gscore, samples = _guess_lookkey_column(df)
+        if gcol:
+            df = df.rename(columns={gcol: "LookKey"})
+            lookkey_from, lookkey_score, lookkey_samples = gcol, round(float(gscore), 3), samples
 
+    # Normalize LookKey text
     if "LookKey" in df.columns:
         df["LookKey"] = df["LookKey"].astype(str).str.strip()
 
-    # Parse numeric columns; fill adjustment factors with 1.0 if missing
+    # Force numeric views & fill sane defaults for factors
     for col in NUMERIC_COLS:
         if col not in df.columns:
             df[col] = ""
@@ -153,6 +160,7 @@ def load_lookup() -> Dict[str, Any]:
             nums = nums.fillna(1.0)
         df[col+"__num"] = nums
 
+    # Build audit AFTER numeric columns are added
     audit = {
         "path": str(LOOKUP_CSV),
         "rows": int(df.shape[0]),
@@ -160,12 +168,13 @@ def load_lookup() -> Dict[str, Any]:
         "normalized_from": renamed,
         "missing_canonical_columns": [c for c in CANONICAL_COLUMNS if c not in df.columns],
         "sample_keys": df["LookKey"].head(20).tolist() if "LookKey" in df.columns else [],
-        "lookkey_autodetected_from": lookkey_guess_from,
-        "lookkey_autodetect_score": lookkey_guess_score,
+        "lookkey_autodetected_from": lookkey_from,
+        "lookkey_autodetect_score": lookkey_score,
+        "lookkey_sample_values": lookkey_samples,
     }
     return {"df": df, "audit": audit}
 
-# ---------- helpers for key building ----------
+# ---------- token helpers ----------
 def _base(existing_window: str) -> str:
     return "Single" if "single" in existing_window.lower() else "Double"
 
@@ -284,13 +293,12 @@ def _debug_payload(
     prefix_hint: str,
     resolved_tokens: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Builds the debug dict when a LookKey miss occurs (and for UI panel)."""
     btag = _btag(bt, school_sub, mf_size)
     last_key = attempted[-1] if attempted else ""
     prefix_for_suggest = re.sub(r"\d+$", "", prefix_hint)
     return {
         "attempted_keys": attempted,
-        "matched_keys": {},  # none; this is a miss path
+        "matched_keys": {},
         "expected_building_prefix": f"{base}{csw}{btag}",
         "inventory_keys_for_building_prefix": _inventory(df, base, csw, btag)[:50],
         "prefix_used_for_suggestions": prefix_for_suggest,
@@ -452,7 +460,7 @@ def compute_savings(inp: Inputs) -> EngineResult:
     area = max(area or 0.0, 0.0)
 
     elec_heat_kwh = per_sf["ElecHeat_kWh_SF"] * area
-    cool_kwh      = per_sf["Cool_kWh_SF"] * area
+    cool_kwh      = per_sf["Cool_KWh_SF"] * area if "Cool_KWh_SF" in per_sf else per_sf["Cool_kWh_SF"] * area
     gas_therms    = per_sf["GasHeat_therm_SF"] * area
     total_kwh     = elec_heat_kwh + cool_kwh
     cost_savings  = total_kwh * float(inp.elec_rate_per_kwh) + gas_therms * float(inp.gas_rate_per_therm)
@@ -461,7 +469,7 @@ def compute_savings(inp: Inputs) -> EngineResult:
     if not math.isnan(base_eui) and not math.isnan(csw_eui):
         eui_savings = base_eui - csw_eui
 
-    # Success-path debug (also useful)
+    # Success-path debug
     btag = _btag(bt, inp.school_subtype, mf_size)
     last_key = attempted[-1] if attempted else ""
     prefix_for_suggest = re.sub(r"\d+$","", last_key)
