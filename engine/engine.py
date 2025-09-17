@@ -82,15 +82,69 @@ def _normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str,str], L
     missing = [c for c in CANONICAL_COLUMNS if c not in df.columns]
     return df, rename, missing
 
+def _guess_lookkey_column(df: pd.DataFrame) -> tuple[Optional[str], float]:
+    """
+    Heuristically detect the LookKey column when the header is weird (e.g., a title).
+    Strategy:
+      - prefer object/string cols
+      - sample values and score by:
+        * startswith 'Single' or 'Double'
+        * contains building tokens (Office|Hotel|Hosp|MF|PS|SS)
+        * contains digits (hours buckets etc.)
+        * high uniqueness
+      - small bonus if header contains 'savings' and 'lookup'
+    Returns (column_name, score) or (None, 0.0)
+    """
+    tokens_re = re.compile(r"(Office|Hotel|Hosp|MF|PS|SS|School)", re.I)
+    best = (None, 0.0)
+    n = min(250, len(df))
+    for c in df.columns:
+        s_name = _norm(str(c))
+        ser = df[c].astype(str).str.strip()
+        sample = ser.head(n)
+
+        if sample.isna().all():
+            continue
+
+        starts = sample.str.startswith(("Single", "Double")).mean()
+        contains_tok = sample.str.contains(tokens_re, na=False).mean()
+        has_digit = sample.str.contains(r"\d", na=False).mean()
+        uniq_frac = (sample.nunique(dropna=True) / max(len(sample), 1))
+
+        score = 2*starts + 2*contains_tok + 0.5*has_digit + 1.0*uniq_frac
+        if ("savings" in s_name and "lookup" in s_name):
+            score += 0.5
+
+        if score > best[1]:
+            best = (c, score)
+
+    # Require a reasonable threshold
+    if best[1] >= 2.0:
+        return best
+    return (None, 0.0)
+
 @lru_cache(maxsize=1)
 def load_lookup() -> Dict[str, Any]:
     if not LOOKUP_CSV.exists():
         raise FileNotFoundError(f"Missing {LOOKUP_CSV}.")
     df = pd.read_csv(LOOKUP_CSV, dtype=str, encoding="utf-8-sig").fillna("")
     df, renamed, missing = _normalize_columns(df)
+
+    lookkey_guess_from = None
+    lookkey_guess_score = None
+
+    # If LookKey is still missing, try to guess it by content
+    if "LookKey" not in df.columns:
+        guess_col, score = _guess_lookkey_column(df)
+        if guess_col is not None:
+            df = df.rename(columns={guess_col: "LookKey"})
+            lookkey_guess_from = guess_col
+            lookkey_guess_score = round(float(score), 3)
+
     if "LookKey" in df.columns:
         df["LookKey"] = df["LookKey"].astype(str).str.strip()
 
+    # Parse numeric columns; fill adjustment factors with 1.0 if missing
     for col in NUMERIC_COLS:
         if col not in df.columns:
             df[col] = ""
@@ -104,8 +158,10 @@ def load_lookup() -> Dict[str, Any]:
         "rows": int(df.shape[0]),
         "columns_present": list(df.columns),
         "normalized_from": renamed,
-        "missing_canonical_columns": missing,
+        "missing_canonical_columns": [c for c in CANONICAL_COLUMNS if c not in df.columns],
         "sample_keys": df["LookKey"].head(20).tolist() if "LookKey" in df.columns else [],
+        "lookkey_autodetected_from": lookkey_guess_from,
+        "lookkey_autodetect_score": lookkey_guess_score,
     }
     return {"df": df, "audit": audit}
 
@@ -226,11 +282,11 @@ def _debug_payload(
     base: str,
     csw: str,
     prefix_hint: str,
+    resolved_tokens: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Builds the debug dict when a LookKey miss occurs (and for UI panel)."""
     btag = _btag(bt, school_sub, mf_size)
     last_key = attempted[-1] if attempted else ""
-    # For suggestions, drop trailing digits (e.g., Office hour buckets)
     prefix_for_suggest = re.sub(r"\d+$", "", prefix_hint)
     return {
         "attempted_keys": attempted,
@@ -241,6 +297,7 @@ def _debug_payload(
         "prefix_candidates": _prefix(df, prefix_for_suggest, 50),
         "similar_keys": _similar(df, last_key, 20),
         "csv_audit": audit,
+        "resolved_tokens": resolved_tokens,
     }
 
 # ---------- main compute ----------
@@ -266,6 +323,12 @@ def compute_savings(inp: Inputs) -> EngineResult:
     matched: Dict[str, Dict[str, Any]] = {}
 
     bt = inp.building_type
+    resolved_tokens_common = {
+        "base": base, "csw": csw, "fuel": fuel, "hvac_code": hvac,
+        "building_type": bt, "school_subtype": inp.school_subtype,
+        "mf_size": mf_size, "hdd": inp.hdd, "cdd": inp.cdd
+    }
+
     if bt == "Office":
         size = _derive_office_size(inp.area_sf or 0, hvac)
         hours = inp.annual_hours or HOURS_BUCKETS[1]
@@ -279,7 +342,11 @@ def compute_savings(inp: Inputs) -> EngineResult:
         if r_lo is None or r_hi is None:
             raise ValueError(
                 "no LookKey match.",
-                _debug_payload(df, audit, attempted, bt, inp.school_subtype, mf_size, base, csw, f"{base}{csw}{size}Office{hvac}{fuel}")
+                _debug_payload(
+                    df, audit, attempted, bt, inp.school_subtype, mf_size,
+                    base, csw, f"{base}{csw}{size}Office{hvac}{fuel}",
+                    {**resolved_tokens_common, "office_size": size, "hours": hours, "lo_bucket": lo_b, "hi_bucket": hi_b}
+                )
             )
         matched[k_lo] = _rowdbg(r_lo); matched[k_hi] = _rowdbg(r_hi)
         e = (1-t)*_safe_num(r_lo["ElecHeat_kWh_SF__num"]) + t*_safe_num(r_hi["ElecHeat_kWh_SF__num"])
@@ -301,7 +368,11 @@ def compute_savings(inp: Inputs) -> EngineResult:
         if r is None:
             raise ValueError(
                 "no LookKey match.",
-                _debug_payload(df, audit, attempted, bt, inp.school_subtype, None, base, csw, f"{base}{csw}{subcode}{hvac}{fuel}")
+                _debug_payload(
+                    df, audit, attempted, bt, inp.school_subtype, None,
+                    base, csw, f"{base}{csw}{subcode}{hvac}{fuel}",
+                    {**resolved_tokens_common, "school_subcode": subcode}
+                )
             )
         matched[key] = _rowdbg(r)
         e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
@@ -318,7 +389,11 @@ def compute_savings(inp: Inputs) -> EngineResult:
         if r is None:
             raise ValueError(
                 "no LookKey match.",
-                _debug_payload(df, audit, attempted, bt, None, None, base, csw, f"{base}{csw}{size}Hotel{hvac}{fuel}")
+                _debug_payload(
+                    df, audit, attempted, bt, None, None,
+                    base, csw, f"{base}{csw}{size}Hotel{hvac}{fuel}",
+                    {**resolved_tokens_common, "hotel_size": size, "pthp_band": band}
+                )
             )
         matched[key] = _rowdbg(r)
         e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
@@ -333,7 +408,11 @@ def compute_savings(inp: Inputs) -> EngineResult:
         if r is None:
             raise ValueError(
                 "no LookKey match.",
-                _debug_payload(df, audit, attempted, bt, None, None, base, csw, f"{base}{csw}Hosp{hvac}{fuel}")
+                _debug_payload(
+                    df, audit, attempted, bt, None, None,
+                    base, csw, f"{base}{csw}Hosp{hvac}{fuel}",
+                    {**resolved_tokens_common}
+                )
             )
         matched[key] = _rowdbg(r)
         e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
@@ -351,7 +430,11 @@ def compute_savings(inp: Inputs) -> EngineResult:
         if r is None:
             raise ValueError(
                 "no LookKey match.",
-                _debug_payload(df, audit, attempted, bt, None, size, base, csw, f"{base}{csw}{size}MF{hvac}{fuel}")
+                _debug_payload(
+                    df, audit, attempted, bt, None, size,
+                    base, csw, f"{base}{csw}{size}MF{hvac}{fuel}",
+                    {**resolved_tokens_common, "mf_size": size}
+                )
             )
         matched[key] = _rowdbg(r)
         e = _safe_num(r["ElecHeat_kWh_SF__num"]); c = _safe_num(r["Cool_kWh_SF__num"]); g = _safe_num(r["GasHeat_therm_SF__num"])
@@ -391,6 +474,10 @@ def compute_savings(inp: Inputs) -> EngineResult:
         "prefix_candidates": _prefix(df, prefix_for_suggest, 50),
         "similar_keys": _similar(df, last_key, 20),
         "csv_audit": audit,
+        "resolved_tokens": {
+            **resolved_tokens_common,
+            "office_size": locals().get("size") if bt=="Office" else None,
+        },
     }
 
     return EngineResult(
