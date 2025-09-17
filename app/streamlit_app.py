@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import re
 
-# ============== Setup & Imports ==============
+# ================== Setup & Imports ==================
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -21,7 +21,7 @@ st.markdown("> **Preliminary estimates only.** For detailed results, a full ener
 
 DATA_DIR = REPO_ROOT / "data"
 
-# ============== Data Loaders ==============
+# ================== Data Loaders ==================
 @st.cache_data(show_spinner=False)
 def _load_weather_fallback():
     p = DATA_DIR / "weather_information.csv"
@@ -47,8 +47,10 @@ def _load_lookup_fallback():
 def load_hvac_overrides():
     p = DATA_DIR / "hvac_overrides.csv"
     if not p.exists():
+        # empty schema so code paths still work
         return pd.DataFrame(columns=["Building Type", "Sub-Building Type", "HVAC Option"])
     df = pd.read_csv(p)
+    # Normalize strings
     for c in ["Building Type", "Sub-Building Type", "HVAC Option"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
@@ -75,7 +77,7 @@ except Exception as e:
 
 overrides_df = load_hvac_overrides()
 
-# ============== Helpers ==============
+# ================== Helpers ==================
 def _to_num(x):
     try:
         return float(str(x).replace(",", ""))
@@ -94,6 +96,7 @@ def _clean_options(series):
     return ordered
 
 def hvac_options_for_building(lists_df: pd.DataFrame, building_label: str):
+    """Fallback: read 'HVAC Type, <building>' column from lists.csv."""
     if lists_df is None or lists_df.empty or not building_label:
         return []
     tokens_map = {
@@ -118,6 +121,12 @@ def hvac_options_for_building(lists_df: pd.DataFrame, building_label: str):
     return []
 
 def hvac_options_from_overrides(overrides_df: pd.DataFrame, building_type: str, sub_building_type: str, lists_df: pd.DataFrame):
+    """
+    Preferred: use data/hvac_overrides.csv for (Building, Sub-Building).
+    Fallback: use building-wide column from lists.csv.
+    Always ensure 'Other' is available.
+    """
+    # Use overrides if present
     if overrides_df is not None and not overrides_df.empty and sub_building_type:
         mask = (
             overrides_df["Building Type"].str.casefold() == str(building_type).casefold()
@@ -125,7 +134,8 @@ def hvac_options_from_overrides(overrides_df: pd.DataFrame, building_type: str, 
             overrides_df["Sub-Building Type"].str.casefold() == str(sub_building_type).casefold()
         )
         rows = overrides_df.loc[mask, "HVAC Option"]
-        opts = [o for o in rows.dropna().astype(str).map(str.strip).tolist() if o and o.lower() not in ("none","nan")]
+        opts = [o for o in rows.dropna().astype(str).map(str.strip).tolist() if o and o.lower() not in ("none", "nan")]
+        # De-dup while preserving order
         seen, cleaned = set(), []
         for o in opts:
             if o not in seen:
@@ -135,12 +145,21 @@ def hvac_options_from_overrides(overrides_df: pd.DataFrame, building_type: str, 
                 cleaned.append("Other")
             return cleaned
 
+    # Fallback
     fallback = hvac_options_for_building(lists_df, building_type) or []
     if not any(o.lower() == "other" for o in fallback):
         fallback.append("Other")
     return fallback
 
 def compute_sub_building(building_type: str, area_ft2: float, floors: int, hvac_type: str, school_subtype: str | None):
+    """
+    Current rules (mirroring the Excel logic we’ve inferred):
+      Office: Large if (area>30,000 ft² and HVAC == 'Built-up VAV with hydronic reheat'); else Mid-size.
+      Hotel:  Small if HVAC in {PTAC, PTHP}; else Large. (Initial default will be Large if HVAC not chosen yet.)
+      School: Subtype is user-selected (Primary/Secondary).
+      Multi-family: Low-rise if floors < 4; else Mid-rise.
+      Hospital: fixed ('Hospital').
+    """
     bt = (building_type or "").strip()
 
     if bt == "Office":
@@ -166,6 +185,11 @@ def compute_sub_building(building_type: str, area_ft2: float, floors: int, hvac_
     return bt
 
 def compute_wwr(area_ft2: float, floors: int, csw_area_ft2: float, wall_height_ft: float = 15.0) -> float:
+    """
+    Excel WWR formula:
+      WWR = CSW Area / [ (sqrt(Building Area / Floors) * 4) * Wall Height * Floors ]
+           = F27 / ((F18/F19)^0.5 * 4 * 15 * F19)
+    """
     try:
         area = float(area_ft2)
         flrs = int(floors)
@@ -182,7 +206,7 @@ def compute_wwr(area_ft2: float, floors: int, csw_area_ft2: float, wall_height_f
         return 0.0
     return csw / wall_area
 
-# ============== Wizard State ==============
+# ================== Wizard State ==================
 TOTAL_STEPS = 6
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -200,11 +224,11 @@ def progress_bar():
 def _restore_sticky(cur_key: str, saved_key: str):
     """If current key is empty but saved exists, restore."""
     cur = st.session_state.get(cur_key)
-    if (cur is None or cur == "") and st.session_state.get(saved_key):
+    if (cur is None or cur == "") and st.session_state.get(saved_key) not in (None, ""):
         st.session_state[cur_key] = st.session_state[saved_key]
     return st.session_state.get(cur_key)
 
-# ---------- Prereq guards (with restore first) ----------
+# ---------- Prereq guards (restore first) ----------
 def require_location_before(step_num: int):
     if step_num >= 2:
         _restore_sticky("state", "state_saved")
@@ -225,7 +249,7 @@ def require_building_before(step_num: int):
 require_location_before(st.session_state.step)
 require_building_before(st.session_state.step)
 
-# ============== Step 1: Project & Location ==============
+# ================== Step 1: Project & Location ==================
 if st.session_state.step == 1:
     st.header("Step 1 — Project & Location")
 
@@ -245,7 +269,6 @@ if st.session_state.step == 1:
 
     states = sorted(wdf["State"].unique().tolist())
     st.selectbox("State", states, key="state")
-    # persist immediately
     st.session_state["state_saved"] = st.session_state.get("state")
 
     cities = sorted(wdf.loc[wdf["State"] == st.session_state.get("state"), "Cities"].unique().tolist())
@@ -265,7 +288,6 @@ if st.session_state.step == 1:
 
     st.session_state["hdd65"] = hdd
     st.session_state["cdd65"] = cdd
-    # persist immediately
     st.session_state["hdd65_saved"] = hdd
     st.session_state["cdd65_saved"] = cdd
 
@@ -279,7 +301,7 @@ if st.session_state.step == 1:
     progress_bar()
     st.button("Next →", on_click=go_next, type="primary")
 
-# ============== Step 2: Building Type ONLY (School subtype here) ==============
+# ================== Step 2: Building Type (School subtype here) ==================
 elif st.session_state.step == 2:
     st.header("Step 2 — Building Type")
 
@@ -297,7 +319,7 @@ elif st.session_state.step == 2:
     with col1: st.button("← Back", on_click=go_back)
     with col2: st.button("Next →", on_click=go_next, type="primary")
 
-# ============== Step 3: Building Details (varies by building type) ==============
+# ================== Step 3: Building Details (varies by building type) ==================
 elif st.session_state.step == 3:
     st.header("Step 3 — Building Details")
 
@@ -308,6 +330,7 @@ elif st.session_state.step == 3:
 
     school_subtype_val = st.session_state.get("school_subtype_saved") or st.session_state.get("school_subtype")
 
+    # Common selectors
     def heating_fuel_select():
         st.selectbox("Heating Fuel", ["Natural gas", "Electric", "None"], key="heating_fuel")
 
@@ -317,31 +340,42 @@ elif st.session_state.step == 3:
     def cooling_installed_select():
         st.selectbox("Cooling Installed?", ["Yes", "No"], key="cooling_installed")
 
-    def hvac_options_for_building_local(bt):
-        if not bt:
-            return []
-        return hvac_options_for_building(lists_df, bt)
-
-    def hvac_select_building_wide(bt):
-        options = hvac_options_for_building_local(bt)
-        idx = options.index(st.session_state["hvac_type"]) if st.session_state.get("hvac_type") in options else (0 if options else None)
-        st.selectbox("HVAC System Type", options, key="hvac_type", index=idx if idx is not None else 0)
-
-    def hvac_select_with_overrides(bt, sub_building_type: str):
+    # HVAC selectors (override-aware)
+    def hvac_select_with_overrides(bt: str, sub_building_type: str):
         options = hvac_options_from_overrides(overrides_df, bt, sub_building_type, lists_df)
-        idx = options.index(st.session_state["hvac_type"]) if st.session_state.get("hvac_type") in options else (0 if options else None)
-        st.selectbox("HVAC System Type", options, key="hvac_type", index=idx if idx is not None else 0, help=f"Options for **{bt} → {sub_building_type}**")
+        if not options:
+            options = ["Other"]
+        idx = options.index(st.session_state["hvac_type"]) if st.session_state.get("hvac_type") in options else 0
+        st.selectbox("HVAC System Type", options, key="hvac_type", index=idx, help=f"Options for **{bt} → {sub_building_type}**")
 
+    # ---- Per-building layouts ----
     if building_type == "Office":
         st.number_input("Building Area (ft²)", min_value=0.0, value=float(st.session_state.get("area_ft2", 100000.0)), step=1000.0, format="%.0f", key="area_ft2")
         st.number_input("Number of Floors", min_value=1, value=int(st.session_state.get("floors", 3)), step=1, key="floors")
-        hvac_select_building_wide("Office")
+
+        # Provisional sub-building (uses current HVAC pick too)
+        sub_guess = compute_sub_building(
+            "Office",
+            st.session_state.get("area_ft2", 0.0),
+            st.session_state.get("floors", 1),
+            st.session_state.get("hvac_type", ""),
+            None
+        )
+        hvac_select_with_overrides("Office", sub_guess)
+
         heating_fuel_select()
         st.number_input("Annual Operating Hours", min_value=0, max_value=8760, value=int(st.session_state.get("annual_hours", 4000)), step=100, key="annual_hours")
         existing_window_select()
         cooling_installed_select()
 
-        sub_build = compute_sub_building("Office", st.session_state.get("area_ft2", 0.0), st.session_state.get("floors", 1), st.session_state.get("hvac_type", ""), None)
+        # Final sub-building after inputs
+        sub_build = compute_sub_building(
+            "Office",
+            st.session_state.get("area_ft2", 0.0),
+            st.session_state.get("floors", 1),
+            st.session_state.get("hvac_type", ""),
+            None
+        )
         st.session_state["sub_building_type"] = sub_build
         st.info(f"**Sub-Building Type:** {sub_build}")
 
@@ -349,22 +383,47 @@ elif st.session_state.step == 3:
         st.number_input("Building Area (ft²)", min_value=0.0, value=float(st.session_state.get("area_ft2", 80000.0)), step=1000.0, format="%.0f", key="area_ft2")
         st.number_input("Number of Floors", min_value=1, value=int(st.session_state.get("floors", 2)), step=1, key="floors")
         existing_window_select()
-        sub_build_known = compute_sub_building("School", st.session_state.get("area_ft2", 0.0), st.session_state.get("floors", 1), st.session_state.get("hvac_type", ""), school_subtype_val)
+
+        sub_build_known = compute_sub_building(
+            "School",
+            st.session_state.get("area_ft2", 0.0),
+            st.session_state.get("floors", 1),
+            st.session_state.get("hvac_type", ""),
+            school_subtype_val
+        )
         hvac_select_with_overrides("School", sub_build_known)
         cooling_installed_select()
         heating_fuel_select()
+
         st.session_state["sub_building_type"] = sub_build_known
         st.info(f"**Sub-Building Type:** {sub_build_known}")
 
     elif building_type == "Hotel":
         st.number_input("Building Area (ft²)", min_value=0.0, value=float(st.session_state.get("area_ft2", 120000.0)), step=1000.0, format="%.0f", key="area_ft2")
         st.number_input("Number of Floors", min_value=1, value=int(st.session_state.get("floors", 4)), step=1, key="floors")
-        hvac_select_building_wide("Hotel")
+
+        # Provisional sub-building based on current HVAC
+        sub_guess_hotel = compute_sub_building(
+            "Hotel",
+            st.session_state.get("area_ft2", 0.0),
+            st.session_state.get("floors", 1),
+            st.session_state.get("hvac_type", ""),
+            None
+        )
+        hvac_select_with_overrides("Hotel", sub_guess_hotel)
+
         st.number_input("Average Occupancy Rate (%)", min_value=0.0, max_value=100.0, value=float(st.session_state.get("hotel_occupancy_pct", 70.0)), step=1.0, key="hotel_occupancy_pct")
         heating_fuel_select()
         cooling_installed_select()
         existing_window_select()
-        sub_build = compute_sub_building("Hotel", st.session_state.get("area_ft2", 0.0), st.session_state.get("floors", 1), st.session_state.get("hvac_type", ""), None)
+
+        sub_build = compute_sub_building(
+            "Hotel",
+            st.session_state.get("area_ft2", 0.0),
+            st.session_state.get("floors", 1),
+            st.session_state.get("hvac_type", ""),
+            None
+        )
         st.session_state["sub_building_type"] = sub_build
         st.info(f"**Sub-Building Type:** {sub_build}")
 
@@ -376,18 +435,26 @@ elif st.session_state.step == 3:
         heating_fuel_select()
         cooling_installed_select()
         existing_window_select()
+
         st.session_state["sub_building_type"] = sub_build_fixed
         st.info(f"**Sub-Building Type:** {sub_build_fixed}")
 
     elif building_type == "Multi-family":
         st.number_input("Building Area (ft²)", min_value=0.0, value=float(st.session_state.get("area_ft2", 90000.0)), step=1000.0, format="%.0f", key="area_ft2")
         st.number_input("Number of Floors", min_value=1, value=int(st.session_state.get("floors", 3)), step=1, key="floors")
-        sub_build_mf = compute_sub_building("Multi-family", st.session_state.get("area_ft2", 0.0), st.session_state.get("floors", 1), "", None)
+        sub_build_mf = compute_sub_building(
+            "Multi-family",
+            st.session_state.get("area_ft2", 0.0),
+            st.session_state.get("floors", 1),
+            "",
+            None
+        )
         hvac_select_with_overrides("Multi-family", sub_build_mf)
         heating_fuel_select()
         cooling_installed_select()
         st.checkbox("Include infiltration savings", value=bool(st.session_state.get("mf_include_infiltration", True)), key="mf_include_infiltration")
         existing_window_select()
+
         st.session_state["sub_building_type"] = sub_build_mf
         st.info(f"**Sub-Building Type:** {sub_build_mf}")
 
@@ -400,13 +467,14 @@ elif st.session_state.step == 3:
     with col1: st.button("← Back", on_click=go_back)
     with col2: st.button("Next →", on_click=go_next, type="primary")
 
-# ============== Step 4: Proposed CSW ==============
+# ================== Step 4: Proposed CSW ==================
 elif st.session_state.step == 4:
     st.header("Step 4 — Proposed CSW")
 
     st.selectbox("Type of CSW Analyzed", ["Single", "Double"], key="csw_type")
     st.number_input("Sq. Ft. of CSW Installed", min_value=0.0, value=float(st.session_state.get("csw_area_ft2", 10000.0)), step=500.0, format="%.0f", key="csw_area_ft2")
 
+    # Derived: WWR (Excel-equivalent)
     area = st.session_state.get("area_ft2", 0.0)
     floors = st.session_state.get("floors", 1)
     csw_area = st.session_state.get("csw_area_ft2", 0.0)
@@ -421,7 +489,7 @@ elif st.session_state.step == 4:
     with col1: st.button("← Back", on_click=go_back)
     with col2: st.button("Next →", on_click=go_next, type="primary")
 
-# ============== Step 5: Rates ==============
+# ================== Step 5: Rates ==================
 elif st.session_state.step == 5:
     st.header("Step 5 — Utility Rates")
 
@@ -433,11 +501,16 @@ elif st.session_state.step == 5:
     with col1: st.button("← Back", on_click=go_back)
     with col2: st.button("Next →", on_click=go_next, type="primary")
 
-# ============== Step 6: Review & Results (placeholder) ==============
+# ================== Step 6: Review & Results (placeholder) ==================
 elif st.session_state.step == 6:
     st.header("Step 6 — Review & Results")
 
-    wwr = compute_wwr(st.session_state.get("area_ft2", 0.0), st.session_state.get("floors", 1), st.session_state.get("csw_area_ft2", 0.0), wall_height_ft=15.0)
+    wwr = compute_wwr(
+        st.session_state.get("area_ft2", 0.0),
+        st.session_state.get("floors", 1),
+        st.session_state.get("csw_area_ft2", 0.0),
+        wall_height_ft=15.0,
+    )
     st.session_state["wwr"] = wwr
 
     summary = {
@@ -472,7 +545,10 @@ elif st.session_state.step == 6:
     st.dataframe(pd.DataFrame([summary]).T.rename(columns={0: "Value"}))
 
     st.subheader("Results (Preview)")
-    st.info("Regression-driven energy savings will appear here once we wire the Office regression + Savings Lookup logic.")
+    st.info(
+        "Regression-driven energy savings (kWh/therms/$), EUI changes, and peak cooling "
+        "will appear here once we wire the Office regression + Savings Lookup logic."
+    )
     cA, cB, cC = st.columns(3)
     with cA: st.metric("Annual Electric Savings (kWh/yr)", "—")
     with cB: st.metric("Annual Natural Gas Savings (therms/yr)", "—")
