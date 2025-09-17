@@ -1,10 +1,17 @@
-# app/streamlit_app.py
-import streamlit as st
-import pandas as pd
+# app/streamlit_app.py  (TOP OF FILE)
 from pathlib import Path
-from typing import Dict, List, Optional
+import sys
 
-from engine.engine import Inputs, compute_savings
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# Prefer package import; fall back if __init__.py is missing
+try:
+    from engine import Inputs, compute_savings
+except Exception:
+    from engine.engine import Inputs, compute_savings
+
 
 APP_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = APP_DIR / "data"
